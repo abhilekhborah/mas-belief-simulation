@@ -1,4 +1,5 @@
-"""Model clients: an OpenAI-compatible HTTP client, a local Hugging Face client, and an offline fake.
+"""Model clients: an OpenAI-compatible HTTP client, a local Hugging Face client, a vLLM client,
+and an offline fake.
 
 The HTTP client uses only the standard library and works with any provider
 exposing an OpenAI-style ``POST {base_url}/chat/completions`` endpoint. The
@@ -10,15 +11,29 @@ this process, on CPU or, with ``--gpu``, on CUDA GPUs. ``torch`` and
 ``transformers`` are imported only when that backend is chosen, so the rest of
 the project stays standard-library only.
 
+The vLLM client talks to a vLLM server over its OpenAI-compatible API, so it needs no
+extra Python packages here; the ``vllm`` command only has to be installed. It either
+starts ``vllm serve`` itself on a free local port and stops it afterwards, or connects
+to a server that is already running. Because vLLM batches concurrent requests, trials
+run in parallel on this backend.
+
 The fake client returns random but schema-valid JSON. It exists only to test
 the pipeline without keys; its outputs carry no scientific meaning.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import os
 import random
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -140,7 +155,8 @@ class FakeClient:
 
 
 DEFAULT_HF_MODEL = "Qwen/Qwen3.8-27B"
-BACKENDS = ("api", "hf", "fake")
+DEFAULT_VLLM_MODEL = DEFAULT_HF_MODEL
+BACKENDS = ("api", "hf", "vllm", "fake")
 
 
 def strip_thinking(text: str, started_in_prompt: bool = False) -> str:
@@ -254,18 +270,222 @@ class HFLocalClient:
         )
 
 
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class VLLMClient(OpenAICompatibleClient):
+    """Chat client for a vLLM server that this process starts, or that is already running.
+
+    Without ``llm.vllm.base_url`` it launches ``vllm serve`` on a free local port, waits until
+    ``GET /health`` succeeds, and stops the server in ``close()`` and at interpreter exit. With
+    ``base_url`` it only connects to a server you started yourself. Requests go to vLLM's
+    OpenAI-compatible ``/v1/chat/completions``, so trials can run in parallel and vLLM batches
+    them. A temperature of ``null`` or 0 means greedy decoding, as for the Hugging Face backend.
+    """
+
+    def __init__(self, settings: Dict, seed: int, log_dir: Optional[str] = None) -> None:
+        vllm = dict(settings.get("vllm", {}))
+        self.model_name = vllm.get("model") or DEFAULT_VLLM_MODEL
+        self.enable_thinking = bool(vllm.get("enable_thinking", False))
+        self._stop_timeout = float(vllm.get("stop_timeout_seconds", 30))
+        self._sigterm = None
+        self._process: Optional[subprocess.Popen] = None
+        self._log_handle = None
+        self._log_path = os.path.join(log_dir or tempfile.gettempdir(), "vllm_server.log")
+        external = str(vllm.get("base_url") or "").strip().rstrip("/")
+        if external.endswith("/v1"):
+            external = external[: -len("/v1")]
+        self.owns_server = not external
+        port = int(vllm.get("port") or 0) or (_free_port() if self.owns_server else 0)
+        self.server_url = external or f"http://127.0.0.1:{port}"
+        extra_body: Dict = {"chat_template_kwargs": {"enable_thinking": self.enable_thinking}}
+        for key in ("top_p", "top_k", "repetition_penalty"):
+            value = vllm.get(key)
+            if value is not None and not (key == "repetition_penalty" and float(value) == 1.0):
+                extra_body[key] = value
+        extra_body.update(settings.get("extra_body") or {})
+        temperature = settings.get("temperature")
+        super().__init__({
+            "base_url": f"{self.server_url}/v1",
+            "api_key": vllm.get("api_key") or "EMPTY",
+            "model": self.model_name,
+            "temperature": 0 if temperature is None else temperature,
+            "max_tokens": settings.get("max_tokens"),
+            "max_tokens_field": settings.get("max_tokens_field", "max_tokens"),
+            "json_mode": settings.get("json_mode", False),
+            "timeout_seconds": settings.get("timeout_seconds", 120),
+            "max_http_retries": settings.get("max_http_retries", 3),
+            "extra_body": extra_body,
+            "extra_headers": settings.get("extra_headers") or {},
+        })
+        if self.owns_server:
+            self._launch(vllm, seed, port)
+            self._wait_until_ready(float(vllm.get("startup_timeout_seconds", 1800)),
+                                   float(vllm.get("startup_poll_seconds", 2)))
+        elif not self._healthy():
+            raise SystemExit(
+                f"Cannot reach a vLLM server at {self.server_url} (GET /health failed). Start it "
+                "first, or leave llm.vllm.base_url / --vllm-url unset so this program starts one."
+            )
+
+    @property
+    def name(self) -> str:
+        return f"vllm:{self.model_name}"
+
+    def _launch(self, vllm: Dict, seed: int, port: int) -> None:
+        command = [str(part) for part in (vllm.get("command") or ["vllm"])]
+        sibling = os.path.join(os.path.dirname(sys.executable), "vllm")
+        if command == ["vllm"] and os.path.exists(sibling):
+            command = [sibling]
+        if shutil.which(command[0]) is None:
+            raise SystemExit(
+                "The vLLM backend needs the `vllm` command. Install vLLM with `pip install vllm` "
+                "(Linux with NVIDIA GPUs, see https://docs.vllm.ai/), or start a server yourself "
+                "and pass --vllm-url."
+            )
+        tensor_parallel = vllm.get("tensor_parallel_size")
+        if tensor_parallel is not None and int(tensor_parallel) < 1:
+            raise SystemExit("tensor_parallel_size must be at least 1")
+        args = command + ["serve", self.model_name, "--host", "127.0.0.1", "--port", str(port),
+                          "--dtype", str(vllm.get("dtype", "auto")), "--seed", str(seed)]
+        if tensor_parallel is not None:
+            args += ["--tensor-parallel-size", str(int(tensor_parallel))]
+        if vllm.get("max_model_len"):
+            args += ["--max-model-len", str(vllm["max_model_len"])]
+        if vllm.get("gpu_memory_utilization") is not None:
+            args += ["--gpu-memory-utilization", str(vllm["gpu_memory_utilization"])]
+        if self.enable_thinking and vllm.get("reasoning_parser"):
+            args += ["--reasoning-parser", str(vllm["reasoning_parser"])]
+        if vllm.get("trust_remote_code"):
+            args.append("--trust-remote-code")
+        args += [str(extra) for extra in vllm.get("extra_args") or []]
+        os.makedirs(os.path.dirname(os.path.abspath(self._log_path)), exist_ok=True)
+        print(f"Starting vLLM for {self.model_name} at {self.server_url}; server log: "
+              f"{self._log_path}", flush=True)
+        try:
+            self._log_handle = open(self._log_path, "ab")
+            self._process = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, stdout=self._log_handle, stderr=subprocess.STDOUT,
+                start_new_session=os.name == "posix")
+        except OSError as error:
+            raise SystemExit(f"Could not start vLLM ({args[0]}): {error}") from error
+        atexit.register(self.close)
+        self._install_sigterm_handler()
+
+    def _install_sigterm_handler(self) -> None:
+        """Turn SIGTERM into a normal exit so the server is stopped, unless the caller set one."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+        previous = signal.getsignal(signal.SIGTERM)
+        if previous != signal.SIG_DFL:
+            return
+
+        def handler(signum, frame):
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, handler)
+        self._sigterm = (handler, previous)
+
+    def _healthy(self) -> bool:
+        try:
+            with urllib.request.urlopen(f"{self.server_url}/health", timeout=5) as response:
+                return response.status == 200
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _log_tail(self, lines: int = 25) -> str:
+        try:
+            with open(self._log_path, "rb") as handle:
+                return b"".join(handle.readlines()[-lines:]).decode("utf-8", errors="replace")
+        except OSError:
+            return "(no log available)"
+
+    def _wait_until_ready(self, timeout: float, poll: float) -> None:
+        deadline = time.monotonic() + timeout
+        ready = False
+        try:
+            while True:
+                code = self._process.poll()
+                if code is not None:
+                    raise SystemExit(f"vLLM exited with code {code} before it was ready. Last lines "
+                                     f"of {self._log_path}:\n{self._log_tail()}")
+                if self._healthy():
+                    ready = True
+                    return
+                if time.monotonic() >= deadline:
+                    raise SystemExit(
+                        f"vLLM was not ready after {timeout:.0f} s. Large models take a long time "
+                        f"to load; raise llm.vllm.startup_timeout_seconds. Log: {self._log_path}")
+                time.sleep(poll)
+        finally:
+            if not ready:
+                self.close()
+
+    def close(self) -> None:
+        """Stop the server this client started. Safe to call more than once."""
+        process, self._process = self._process, None
+        if process is not None and process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+                process.wait(timeout=self._stop_timeout)
+            except ProcessLookupError:
+                pass
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
+        if self._sigterm is not None:
+            handler, previous = self._sigterm
+            self._sigterm = None
+            if (threading.current_thread() is threading.main_thread()
+                    and signal.getsignal(signal.SIGTERM) is handler):
+                signal.signal(signal.SIGTERM, previous)
+
+    def complete(self, messages: List[Dict[str, str]], spec: Dict) -> Completion:
+        completion = super().complete(messages, spec)
+        if "</think>" in completion.text:  # a server without a reasoning parser leaves it in
+            completion.text = completion.text.rsplit("</think>", 1)[1].strip()
+        return completion
+
+
 def resolve_backend(config_backend: Optional[str], fake: bool = False, backend: Optional[str] = None,
-                    gpu: bool = False, hf_model: Optional[str] = None) -> str:
-    """Pick the backend: explicit choice, else implied by --gpu / --hf-model, else config, else api."""
+                    gpu: bool = False, hf_model: Optional[str] = None,
+                    vllm_model: Optional[str] = None, vllm_url: Optional[str] = None,
+                    tensor_parallel_size: Optional[int] = None) -> str:
+    """Pick the backend: explicit choice, else implied by a backend-specific flag, else config."""
     chosen = [name for name in ("fake" if fake else None, backend) if name]
     if len(set(chosen)) > 1:
-        raise ValueError("choose only one of --fake, --api and --hf")
+        raise ValueError("choose only one of --fake, --api, --hf and --vllm")
     explicit = chosen[0] if chosen else None
-    if gpu or hf_model:
-        if explicit in ("api", "fake"):
+    hf_flags = bool(gpu or hf_model)
+    vllm_flags = bool(vllm_model or vllm_url or tensor_parallel_size)
+    if hf_flags and vllm_flags:
+        raise ValueError("--gpu and --hf-model belong to --hf; --vllm-model, --vllm-url and "
+                         "--tensor-parallel-size belong to --vllm. Do not mix them")
+    if hf_flags:
+        if explicit in ("api", "fake", "vllm"):
             raise ValueError("--gpu and --hf-model apply only to the Hugging Face backend, "
-                             "not to --api or --fake")
+                             "not to --api, --vllm or --fake")
         explicit = "hf"
+    if vllm_flags:
+        if explicit in ("api", "fake", "hf"):
+            raise ValueError("--vllm-model, --vllm-url and --tensor-parallel-size apply only to "
+                             "the vLLM backend, not to --api, --hf or --fake")
+        explicit = "vllm"
     resolved = explicit or config_backend or "api"
     if resolved not in BACKENDS:
         raise ValueError(f"unknown backend {resolved!r}; use one of {', '.join(BACKENDS)}")
@@ -273,9 +493,20 @@ def resolve_backend(config_backend: Optional[str], fake: bool = False, backend: 
 
 
 def build_client(settings: Dict, backend: str, seed: int, gpu: bool = False,
-                 hf_model: Optional[str] = None):
+                 hf_model: Optional[str] = None, vllm_model: Optional[str] = None,
+                 vllm_url: Optional[str] = None, tensor_parallel_size: Optional[int] = None,
+                 log_dir: Optional[str] = None):
     if backend == "fake":
         return FakeClient(seed=seed, invalid_rate=float(settings.get("fake_invalid_rate", 0.0)))
+    if backend == "vllm":
+        vllm = dict(settings.get("vllm", {}))
+        if vllm_model:
+            vllm["model"] = vllm_model
+        if vllm_url:
+            vllm["base_url"] = vllm_url
+        if tensor_parallel_size is not None:
+            vllm["tensor_parallel_size"] = tensor_parallel_size
+        return VLLMClient({**settings, "vllm": vllm}, seed=seed, log_dir=log_dir)
     if backend == "hf":
         hf = dict(settings.get("hf", {}))
         if hf_model:
@@ -286,7 +517,7 @@ def build_client(settings: Dict, backend: str, seed: int, gpu: bool = False,
         raise SystemExit(
             "Missing LLM settings: " + ", ".join(missing) + ". Fill them in config.json "
             "(or set MAS_BASE_URL / MAS_API_KEY / MAS_MODEL), or run with --fake for an offline "
-            "test or --hf for a local Hugging Face model."
+            "test, --hf for a local Hugging Face model or --vllm for a vLLM server."
         )
     return OpenAICompatibleClient(settings)
 

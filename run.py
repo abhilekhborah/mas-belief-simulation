@@ -6,10 +6,13 @@
   python3 run.py --hf                         real run with a local Hugging Face model (CPU)
   python3 run.py --gpu                        same, on CUDA GPUs (implies --hf)
   python3 run.py --gpu --hf-model Qwen/Qwen3.6-27B   choose another Hugging Face model
+  python3 run.py --vllm                       real run through vLLM (starts `vllm serve` itself)
+  python3 run.py --vllm --tensor-parallel-size 2     spread the model over 2 GPUs
+  python3 run.py --vllm-url http://host:8000  use a vLLM server that is already running
   python3 run.py --limit 5                    run only the first 5 trials (smoke test)
 
-With none of --fake, --api and --hf, the backend named by llm.backend in config.json is used
-(default: api).
+With none of --fake, --api, --hf and --vllm, the backend named by llm.backend in config.json is
+used (default: api).
 """
 
 from __future__ import annotations
@@ -36,10 +39,19 @@ def main() -> None:
                          help="use an OpenAI-compatible API (base_url, api_key, model)")
     backend.add_argument("--hf", action="store_true",
                          help="use a local Hugging Face model (default Qwen/Qwen3.8-27B)")
+    backend.add_argument("--vllm", action="store_true",
+                         help="use vLLM: start `vllm serve` here, or connect with --vllm-url")
     parser.add_argument("--gpu", action="store_true",
                         help="run the Hugging Face model on CUDA GPUs; implies --hf")
     parser.add_argument("--hf-model", metavar="NAME",
                         help="Hugging Face model id or local path; implies --hf")
+    parser.add_argument("--vllm-model", metavar="NAME",
+                        help="model id served by vLLM; implies --vllm")
+    parser.add_argument("--vllm-url", metavar="URL",
+                        help="use an already running vLLM server, e.g. http://localhost:8000; "
+                             "implies --vllm")
+    parser.add_argument("--tensor-parallel-size", type=int, metavar="N",
+                        help="number of GPUs vLLM spreads the model over; implies --vllm")
     parser.add_argument("--plan", action="store_true", help="print the grid and budget, then exit")
     parser.add_argument("--limit", type=int, help="run only the first N trials")
     parser.add_argument("--output-dir", help="override the output directory")
@@ -49,13 +61,15 @@ def main() -> None:
         verify_all()
         print(json.dumps(describe_plan(load_config(args.config)), indent=2))
         return
-    chosen = "api" if args.api else "hf" if args.hf else None
+    chosen = "api" if args.api else "hf" if args.hf else "vllm" if args.vllm else None
     try:
-        resolve_backend(None, args.fake, chosen, args.gpu, args.hf_model)
+        resolve_backend(None, args.fake, chosen, args.gpu, args.hf_model, args.vllm_model,
+                        args.vllm_url, args.tensor_parallel_size)
     except ValueError as error:
         parser.error(str(error))
     run(args.config, fake=args.fake, limit=args.limit, output_dir=args.output_dir,
-        backend=chosen, gpu=args.gpu, hf_model=args.hf_model)
+        backend=chosen, gpu=args.gpu, hf_model=args.hf_model, vllm_model=args.vllm_model,
+        vllm_url=args.vllm_url, tensor_parallel_size=args.tensor_parallel_size)
 
 
 if __name__ == "__main__":

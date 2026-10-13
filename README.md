@@ -4,16 +4,19 @@ A runnable simulation of how a group of LLM agents is influenced by other partic
 all metrics computed from structured model outputs (no LLM judge). It runs two experiments on
 three risk-classified decision scenarios, at 1, 2 and 3 discussion rounds, from one command.
 
-- Three model backends: an OpenAI-compatible **API** (`--api`), a local **Hugging Face** model on
-  CPU (`--hf`) or on GPUs (`--gpu`), and an offline **fake** model for testing (`--fake`).
-- The API and fake backends use only the standard library (Python 3.9+). The Hugging Face backend
-  needs `pip install -r requirements.txt` and Python 3.10+.
+- Four model backends: an OpenAI-compatible **API** (`--api`), a local **Hugging Face** model on
+  CPU (`--hf`) or on GPUs (`--gpu`), a **vLLM** server (`--vllm`), and an offline **fake** model for
+  testing (`--fake`).
+- The API, vLLM and fake backends use only the standard library (Python 3.9+); vLLM just needs its
+  own `vllm` command installed. The Hugging Face backend needs `pip install -r requirements.txt`
+  and Python 3.10+.
 - API settings are blank by default. Whoever runs it fills them in (see [Setup](#2-setup)).
 
 **Status.** Verified offline: the unit tests pass and the full grid runs end to end with the
 built-in fake model. The Hugging Face backend is covered by tests that use stand-ins for `torch`
-and `transformers`. It has **not been run against a real model**, and no live API run has been
-performed either.
+and `transformers`, and the vLLM backend by tests that run a stand-in for `vllm serve`. Neither
+has been run against a **real model or a real vLLM**, and no live API run has been performed
+either.
 
 ## Contents
 
@@ -45,14 +48,19 @@ python3 run.py --api                    # full run through an OpenAI-compatible 
 python3 run.py --hf                     # full run with a local Hugging Face model on CPU
 python3 run.py --gpu                    # the same model on CUDA GPUs (implies --hf)
 python3 run.py --gpu --hf-model NAME    # choose another Hugging Face model
+python3 run.py --vllm                   # full run through vLLM; starts `vllm serve` itself
+python3 run.py --vllm --tensor-parallel-size 2   # vLLM spread over 2 GPUs
+python3 run.py --vllm-url http://HOST:8000       # use a vLLM server that is already running
 python3 run.py --api --limit 5          # smoke test: only the first 5 trials, any backend
-python3 -m unittest discover -s tests   # 27 unit and end-to-end tests
+python3 -m unittest discover -s tests   # 58 unit and end-to-end tests
 ```
 
 `--fake` produces random but schema-valid replies. It exists to test the software; **its
 numbers are not results**.
 
-The backend flags are mutually exclusive. `--gpu` and `--hf-model` imply `--hf`. With no backend
+The backend flags are mutually exclusive. `--gpu` and `--hf-model` imply `--hf`; `--vllm-model`,
+`--vllm-url` and `--tensor-parallel-size` imply `--vllm`. Mixing the two families is an error. With
+no backend
 flag, the backend named by `llm.backend` in [`config.json`](config.json) is used, which is `api`
 by default, so a bare `python3 run.py` is an API run. `--limit N` and `--plan` work with every
 backend.
@@ -61,7 +69,7 @@ Other flags: `--config PATH` (use another config file) and `--output-dir PATH`.
 
 ## 2. Setup
 
-Choose one backend. `--api`, `--hf`, `--gpu` and `--fake` select it on the command line;
+Choose one backend. `--api`, `--hf`, `--gpu`, `--vllm` and `--fake` select it on the command line;
 otherwise `llm.backend` in [`config.json`](config.json) decides (default `api`).
 
 ### Option A: API (`--api`)
@@ -125,6 +133,55 @@ On a GPU machine, install the CUDA build of PyTorch that matches your driver fir
 - **Sampling.** Uses `llm.temperature` with `top_p` and `top_k` from `llm.hf`. A temperature of
   `null` or 0 means greedy decoding. `run.seed` seeds PyTorch before the model loads.
 
+### Option C: vLLM (`--vllm`)
+
+[vLLM](https://docs.vllm.ai/) is a serving engine that batches many requests at once, so it is
+much faster than Option B when trials run in parallel. This program does not import vLLM. It runs
+the `vllm serve` command, waits for the server, and sends it requests through vLLM's
+OpenAI-compatible API using the standard library. That means no packages from this repository are
+needed for it, and vLLM can live in its own environment (it depends on a specific `torch` version
+that can clash with the one from `requirements.txt`, so keep them apart).
+
+```bash
+pip install vllm                       # Linux with NVIDIA GPUs; see the vLLM install guide
+python3 run.py --vllm                  # starts `vllm serve Qwen/Qwen3.8-27B`, runs, stops it
+python3 run.py --vllm --tensor-parallel-size 2         # spread the model over 2 GPUs
+python3 run.py --vllm --vllm-model Qwen/Qwen3.6-27B    # another model
+
+vllm serve Qwen/Qwen3.8-27B --max-model-len 8192       # or start a server yourself ...
+python3 run.py --vllm-url http://localhost:8000        # ... and connect to it
+```
+
+- **Starting the server.** Without `--vllm-url`, the program runs
+  `vllm serve MODEL --host 127.0.0.1 --port FREE_PORT --dtype ... --seed ...` plus the options in
+  `llm.vllm`, so the server is reachable only from this machine. It waits until `GET /health`
+  succeeds (up to `startup_timeout_seconds`, 30 minutes by default, because a 27B model loads
+  slowly), and the server's output goes to `vllm_server.log` in the run folder. If vLLM exits early,
+  the last lines of that log are printed.
+- **Stopping the server.** It is stopped when the run finishes, on an error, on Ctrl-C, on `SIGTERM`
+  and at exit. After Ctrl-C, trials that have not started are dropped, but trials already running
+  finish first. A server you started yourself (`--vllm-url`) is never stopped.
+- **GPUs.** Set `--tensor-parallel-size` to the number of GPUs the model must be spread over. It is
+  not set by default, which means vLLM uses one GPU. Pick GPUs with `CUDA_VISIBLE_DEVICES`.
+- **Parallel trials.** `parallel_trials` applies, and vLLM batches the concurrent requests. With
+  `--vllm-url` set the same number of requests is sent to your server.
+- **Context length.** `llm.vllm.max_model_len` is `8192`. The longest prompt the simulation builds
+  is about 3,800 characters, roughly 1,300 tokens by a rough 3-characters-per-token estimate, plus
+  up to `max_tokens` (800) for the reply. A small limit saves GPU memory. Raise it if you raise
+  `max_tokens` or turn thinking on.
+- **Reasoning mode.** `enable_thinking` is `false`, sent with every request as
+  `chat_template_kwargs`. If you turn it on, the server is started with
+  `--reasoning-parser qwen3` (`llm.vllm.reasoning_parser`) so reasoning is separated from the
+  answer. vLLM's documentation lists that parser for the Qwen3 series; I have not confirmed it for
+  Qwen3.5-architecture models, so change `reasoning_parser` if vLLM says otherwise. For a server
+  you started yourself, start it with a reasoning parser too.
+- **Sampling.** `llm.temperature` (`null` or 0 means greedy) plus `top_p`, `top_k` and
+  `repetition_penalty` from `llm.vllm`, sent in the request body as vLLM's extra sampling fields.
+  `llm.extra_body` is merged in last, so it can override any of them.
+- **Not verified.** vLLM's documentation confirms the command-line flags used here, the `/health`
+  endpoint, `chat_template_kwargs` and that `Qwen3_5ForConditionalGeneration` is a supported
+  architecture. Nothing has been run against a real vLLM, because no GPU was available.
+
 ## 3. What happens when you run it
 
 ```mermaid
@@ -140,7 +197,8 @@ flowchart TD
 
 1. **Config and backend.** [`runner.py`](mas_sim/runner.py) reads the config, applies
    `MAS_BASE_URL`, `MAS_API_KEY`, `MAS_MODEL`, and builds the chosen model client
-   ([`llm.py`](mas_sim/llm.py)). For `--hf` this is where the model is loaded.
+   ([`llm.py`](mas_sim/llm.py)). For `--hf` this is where the model is loaded, and for `--vllm`
+   where `vllm serve` is started. The server is stopped again when the run ends.
 2. **Answer-key check.** [`scenarios.py`](mas_sim/scenarios.py) verifies every scenario
    (see [section 5](#5-the-three-scenarios)). A scenario that fails stops the run before any
    model call.
@@ -446,8 +504,9 @@ PY
 
 ## 9. Output files
 
-Each run writes `runs/<timestamp>/` (`-fake` or `-hf` is appended for offline or local-model
-runs; the location is relative to the config file unless `--output-dir` is given).
+Each run writes `runs/<timestamp>/` (`-fake`, `-hf` or `-vllm` is appended for offline,
+local-model or vLLM runs; the location is relative to the config file unless `--output-dir` is
+given).
 
 | File | Contents |
 |---|---|
@@ -456,6 +515,7 @@ runs; the location is relative to the config file unless `--output-dir` is given
 | `trajectories.csv` | One row per probability report of every model agent: `trial_id`, condition fields, `agent`, `slot` (0-based speaking position; scripts come first), `stage` (`baseline`, `pre_turn`, `terminal`), `round`, `probe_order`, `view_length`, `valid`, `p_A` to `p_D`, `p_correct`, `p_target`, `private_top`, `correct`, `target` |
 | `trials.jsonl` | One record per trial: ids and condition, `letters` (letter to option name), `correct`, `target`, `decoy`, `script_answer`, `ground_truth_audit`, MIT risk tags, `participants` (kind and unique facts), `probes`, `public` transcript, `disclosures`, `initial_votes`, `final_votes`, `group_outcome`, `model_group_outcome`, `model_calls`, `invalid_calls`, `usage` |
 | `calls.jsonl` | Every call attempt: `trial_id`, `agent`, `call_kind`, `stage`, `round`, `attempt`, full `messages`, raw `response`, `valid`, `errors`, `latency_seconds` |
+| `vllm_server.log` | Only for `--vllm` runs that start the server: its output, for diagnosing start-up problems |
 | `summary.json` | `summary`, `contrasts` and `failed_trials` (trials that raised an exception) |
 | `run_config.json` | The settings used, including `backend`, `gpu` and the client name, with the API key removed |
 
@@ -475,7 +535,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `api` | `api`, `hf` or `fake`. A command-line flag (`--api`, `--hf`, `--gpu`, `--fake`) overrides it |
+| `backend` | `api` | `api`, `hf`, `vllm` or `fake`. A command-line flag (`--api`, `--hf`, `--gpu`, `--vllm`, `--fake`) overrides it |
 | `base_url`, `api_key`, `model` | blank | Required for the `api` backend |
 | `temperature` | `0.7` | Sampling temperature; `null` omits it from API requests. For `hf`, `null` or `0` means greedy decoding |
 | `max_tokens` | `800` | Reply length cap, also used by `hf` unless `llm.hf.max_new_tokens` is set; raise it if replies are cut off |
@@ -501,6 +561,33 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `repetition_penalty` | `1.0` | `1.0` turns it off |
 | `trust_remote_code` | `false` | Allows running code shipped inside the model repository; leave off unless a model needs it |
 
+**`llm.vllm`** (vLLM backend)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `model` | `Qwen/Qwen3.8-27B` | Model id passed to `vllm serve` and sent in every request. `--vllm-model NAME` overrides it |
+| `base_url` | empty | Empty: start `vllm serve` here. Set (for example `http://localhost:8000`): connect to that running server instead. `--vllm-url` overrides it |
+| `port` | `null` | Port for a server this program starts; `null` picks a free one |
+| `tensor_parallel_size` | `null` | GPUs to spread the model over; `null` leaves vLLM's default (1). `--tensor-parallel-size N` overrides it |
+| `dtype` | `auto` | Passed to `vllm serve --dtype` |
+| `max_model_len` | `8192` | Context length passed to `vllm serve --max-model-len`; `null` leaves vLLM's default (the model's full context) |
+| `gpu_memory_utilization` | `0.9` | Fraction of GPU memory vLLM may use; `null` leaves its default |
+| `enable_thinking` | `false` | Sent as `chat_template_kwargs.enable_thinking` with every request |
+| `reasoning_parser` | `qwen3` | Passed as `--reasoning-parser`, only when `enable_thinking` is true |
+| `top_p`, `top_k`, `repetition_penalty` | `0.8`, `20`, `1.0` | Sampling fields added to each request; `null` omits one, and a penalty of `1.0` is not sent |
+| `trust_remote_code` | `false` | Passes `--trust-remote-code` to the server |
+| `api_key` | empty | Only for a server started with `--api-key`; otherwise a placeholder is sent. Never written to `run_config.json` |
+| `command` | `["vllm"]` | Program that provides `serve`. Used as is if it is not `vllm`; if `vllm` sits next to the Python interpreter (a virtual environment), that one is used |
+| `extra_args` | `[]` | Extra command-line arguments appended to `vllm serve`, for example `["--enable-prefix-caching"]` |
+| `startup_timeout_seconds` | `1800` | How long to wait for the server to become healthy |
+| `startup_poll_seconds` | `2` | How often the health check runs while waiting |
+| `stop_timeout_seconds` | `30` | How long the server gets to shut down before it is killed |
+
+The `vllm` backend also uses `llm.temperature`, `llm.max_tokens`, `llm.max_tokens_field`,
+`llm.json_mode`, `llm.timeout_seconds`, `llm.max_http_retries`, `llm.extra_body` and
+`llm.extra_headers`, with the same meaning as for the API backend. `run_config.json` hides header
+values and every API key.
+
 **`run`**
 
 | Key | Default | Meaning |
@@ -509,7 +596,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `seed` | `20261012` | Seeds only the shuffle of fact order. Model sampling is not seeded, so real runs are not exactly reproducible |
 | `items_per_scenario` | `1` | Items per scenario. **Items rotate letters and fact ownership; they are not new cases** |
 | `repeats` | `1` | Repeats of every trial |
-| `parallel_trials` | `4` | Trials in flight at once. Lower it if the provider rate-limits you. Ignored (forced to 1) for local Hugging Face models |
+| `parallel_trials` | `4` | Trials in flight at once. Lower it if the provider rate-limits you. Ignored (forced to 1) for local Hugging Face models; applies to `--vllm`, where vLLM batches the requests |
 | `collect_forecasts` | `true` | Include forecasts in private probes. Set `false` to ask for beliefs only |
 | `max_parse_retries` | `2` | Correction retries for an invalid reply |
 | `probability_tolerance` | `1e-06` | How exactly probabilities must sum to 1 |
@@ -586,23 +673,33 @@ backend selection and flag conflicts, chat-template arguments, sampling versus g
 decoding of only the new tokens, removal of reasoning blocks, GPU handling, the install hint when
 packages are missing, and one-call-at-a-time execution.
 
+[`tests/test_vllm_backend.py`](tests/test_vllm_backend.py) covers the vLLM backend with a small
+stand-in program that behaves like `vllm serve` (a health endpoint and a chat endpoint), so it
+runs without vLLM or a GPU: the command line that is built, the request body, waiting for the
+server to become healthy, a server that exits early or never becomes ready, a missing `vllm`
+command, connecting to an existing server without stopping it, stopping the server it started
+(including at the end of a run), and keys being kept out of `run_config.json`. It checks this
+program's own logic, not vLLM itself.
+
 ## 13. Repository layout
 
 ```text
 simulation/
-  run.py                  entry point (--plan, --fake, --api, --hf, --gpu, --hf-model, --limit,
-                          --config, --output-dir)
+  run.py                  entry point (--plan, --fake, --api, --hf, --gpu, --hf-model, --vllm,
+                          --vllm-model, --vllm-url, --tensor-parallel-size, --limit, --config,
+                          --output-dir)
   config.json             all settings; API fields blank
-  requirements.txt        extra packages, needed only for --hf / --gpu
+  requirements.txt        extra packages, needed only for --hf / --gpu (not for --vllm)
   mas_sim/
     scenarios.py          facts, rules, computed ground truth, verification, letter rotation
     prompts.py            system and user prompt templates, transcript format
-    llm.py                API client, local Hugging Face client, offline fake client, JSON extraction
+    llm.py                API, Hugging Face and vLLM clients, offline fake client, JSON extraction
     engine.py             trial runner, reply validation, plurality, unique-top helper
     experiments.py        theory notes and the trial grid builder, call budget
     metrics.py            all metrics, contrasts, trajectory rows
     runner.py             config loading, parallel execution, output writing
   tests/test_simulation.py
   tests/test_hf_backend.py
+  tests/test_vllm_backend.py
   runs/                   created at run time; ignored by git
 ```

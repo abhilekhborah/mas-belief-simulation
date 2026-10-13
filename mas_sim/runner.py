@@ -52,24 +52,47 @@ def describe_plan(config: Dict) -> Dict:
 
 def run(config_path: str, fake: bool = False, limit: Optional[int] = None,
         output_dir: Optional[str] = None, backend: Optional[str] = None, gpu: bool = False,
-        hf_model: Optional[str] = None) -> str:
+        hf_model: Optional[str] = None, vllm_model: Optional[str] = None,
+        vllm_url: Optional[str] = None, tensor_parallel_size: Optional[int] = None) -> str:
     verify_all()
     config = load_config(config_path)
     settings = {**config["llm"], **config["run"]}
     trials = build_trials(config)
     if limit is not None:
         trials = trials[:limit]
-    chosen = resolve_backend(config["llm"].get("backend"), fake, backend, gpu, hf_model)
-    client = build_client(config["llm"], chosen, int(config["run"]["seed"]), gpu=gpu,
-                          hf_model=hf_model)
+    chosen = resolve_backend(config["llm"].get("backend"), fake, backend, gpu, hf_model,
+                             vllm_model, vllm_url, tensor_parallel_size)
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
     base = output_dir or os.path.join(os.path.dirname(os.path.abspath(config_path)),
                                       config["run"].get("output_dir", "runs"))
-    suffix = {"fake": "-fake", "hf": "-hf"}.get(chosen, "")
+    suffix = {"fake": "-fake", "hf": "-hf", "vllm": "-vllm"}.get(chosen, "")
     run_dir = os.path.join(base, f"{stamp}{suffix}")
+    client = build_client(config["llm"], chosen, int(config["run"]["seed"]), gpu=gpu,
+                          hf_model=hf_model, vllm_model=vllm_model, vllm_url=vllm_url,
+                          tensor_parallel_size=tensor_parallel_size, log_dir=run_dir)
+    try:
+        return _run_trials(client, config, settings, trials, chosen, gpu, run_dir)
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()  # stops a vLLM server that this run started
+
+
+def _redacted_llm(llm: Dict) -> Dict:
+    """Copy of the llm settings that is safe to write to disk: no keys, no header values."""
+    safe = {key: value for key, value in llm.items() if key != "api_key"}
+    if isinstance(safe.get("vllm"), dict):
+        safe["vllm"] = {key: value for key, value in safe["vllm"].items() if key != "api_key"}
+    if safe.get("extra_headers"):
+        safe["extra_headers"] = {name: "<hidden>" for name in safe["extra_headers"]}
+    return safe
+
+
+def _run_trials(client, config: Dict, settings: Dict, trials: List, chosen: str, gpu: bool,
+                run_dir: str) -> str:
     os.makedirs(run_dir, exist_ok=True)
-    safe_llm = {key: value for key, value in config["llm"].items() if key != "api_key"}
+    safe_llm = _redacted_llm(config["llm"])
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as handle:
         json.dump({"llm": safe_llm, "run": config["run"], "backend": chosen, "gpu": gpu,
                    "client": client.name, "trials": len(trials)}, handle, indent=2)
@@ -82,7 +105,8 @@ def run(config_path: str, fake: bool = False, limit: Optional[int] = None,
     if getattr(client, "serial", False):
         workers = 1  # a single local model generates one reply at a time
     print(f"Running {len(trials)} trials with {client.name} -> {run_dir}")
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {pool.submit(TrialRunner(trial, client, settings, sink).run): trial for trial in trials}
         for done, future in enumerate(as_completed(futures), start=1):
             trial = futures[future]
@@ -96,6 +120,8 @@ def run(config_path: str, fake: bool = False, limit: Optional[int] = None,
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             if done % 10 == 0 or done == len(trials):
                 print(f"  {done}/{len(trials)} trials finished")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)  # on Ctrl-C, queued trials are dropped
 
     summary_rows = metrics.summarize(results)
     contrast_rows = metrics.contrasts(summary_rows)
