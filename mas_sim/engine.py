@@ -16,10 +16,9 @@ option as their final vote.
 
 from __future__ import annotations
 
-import json
 import random
-import threading
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import prompts
@@ -69,19 +68,9 @@ class TrialSpec:
         }
 
 
-class EventSink:
-    """Thread-safe JSONL writer for every model call attempt."""
-
-    def __init__(self, path: Optional[str]) -> None:
-        self.path = path
-        self.lock = threading.Lock()
-
-    def write(self, record: Dict) -> None:
-        if self.path is None:
-            return
-        line = json.dumps(record, ensure_ascii=False, default=str)
-        with self.lock, open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+def now_iso(precision: str = "milliseconds") -> str:
+    """Local time with its UTC offset, e.g. 2026-10-14T01:31:14.250+05:30."""
+    return datetime.now().astimezone().isoformat(timespec=precision)
 
 
 def validate_distribution(value, keys: Sequence[str], tolerance: float) -> Optional[str]:
@@ -108,10 +97,10 @@ def _clean(value: Dict, keys: Sequence[str]) -> Dict[str, float]:
 
 
 class TrialRunner:
-    def __init__(self, spec: TrialSpec, client, settings: Dict, sink: EventSink) -> None:
+    def __init__(self, spec: TrialSpec, client, settings: Dict) -> None:
         self.spec = spec
         self.client = client
-        self.sink = sink
+        self.call_log: List[Dict] = []
         self.tolerance = float(settings.get("probability_tolerance", 1e-6))
         self.max_parse_retries = int(settings.get("max_parse_retries", 2))
         self.collect_forecasts = bool(settings.get("collect_forecasts", True))
@@ -154,8 +143,9 @@ class TrialRunner:
         return parsed, errors
 
     def _log(self, agent, spec, attempt, messages, text, errors, latency) -> None:
-        self.sink.write({
-            "trial_id": self.spec.trial_id, "agent": agent, "call_kind": spec["call_kind"],
+        self.call_log.append({
+            "call_number": len(self.call_log) + 1, "timestamp": now_iso(),
+            "agent": agent, "call_kind": spec["call_kind"],
             "stage": spec.get("stage"), "round": spec.get("round"), "attempt": attempt,
             "messages": messages, "response": text, "valid": not errors, "errors": errors,
             "latency_seconds": round(latency, 3),
@@ -256,6 +246,7 @@ class TrialRunner:
 
     # -- the trial ---------------------------------------------------------------
     def run(self) -> Dict:
+        started_at = now_iso()
         spec = self.spec
         scenario = SCENARIOS[spec.scenario]
         letters = letter_map(spec.rotation)
@@ -291,12 +282,15 @@ class TrialRunner:
         probes: List[Dict] = []
         transcript: List[Dict] = []
         initial_votes: Dict[str, Optional[str]] = {}
+        initial_rationales: Dict[str, str] = {}
+        skipped_turns: List[Dict] = []
 
         for name in model_names:
             probes.append(self.probe(name, systems[name], [], "baseline", 0, 1, others(name),
                                      names.index(name)))
         for name in model_names:
-            initial_votes[name], _, _ = self.vote(name, systems[name], None, "initial_vote")
+            initial_votes[name], initial_rationales[name], _ = self.vote(
+                name, systems[name], None, "initial_vote")
 
         if spec.info_mode == "reveal_all":
             # Adapted from HiddenBench's Reveal-All ablation: each member's
@@ -320,6 +314,7 @@ class TrialRunner:
                 probes.append(probe)
                 answer, message, errors = self.public_turn(name, systems[name], view, round_number)
                 if answer is None:
+                    skipped_turns.append({"agent": name, "round": round_number, "errors": errors})
                     continue
                 transcript.append({"round": round_number, "speaker": name, "kind": "model",
                                    "answer": answer, "message": message,
@@ -329,13 +324,15 @@ class TrialRunner:
             probes.append(self.probe(name, systems[name], list(transcript), "terminal", spec.rounds,
                                      None, others(name), names.index(name)))
         final_votes: Dict[str, Optional[str]] = {name: script_answer for name in script_names}
+        final_rationales: Dict[str, str] = {}
         for name in model_names:
-            final_votes[name], _, _ = self.vote(
+            final_votes[name], final_rationales[name], _ = self.vote(
                 name, systems[name], prompts.render_transcript(transcript, name), "final_vote")
 
         decision = scenario.decide(knowledge_from(scenario.all_facts()))
         return {
             **spec.to_dict(),
+            "started_at": started_at, "finished_at": now_iso(),
             "letters": {letters[index]: scenario.option_names[index] for index in range(4)},
             "correct": correct, "target": target, "decoy": decoy,
             "script_answer": script_answer if script_names else None,
@@ -346,16 +343,22 @@ class TrialRunner:
             "participants": [{"name": name, "kind": "script" if name in script_names else "model",
                               "unique_facts": [fact.fact_id for fact in unique_facts.get(name, [])]}
                              for name in names],
+            "evidence": {name: [{"fact_id": fact.fact_id, "text": fact.text} for fact in packets[name]]
+                         for name in model_names},
             "probes": probes,
             "public": [entry for entry in transcript if entry["kind"] != "disclosure"],
             "disclosures": [entry for entry in transcript if entry["kind"] == "disclosure"],
             "initial_votes": initial_votes,
+            "initial_rationales": initial_rationales,
             "final_votes": final_votes,
+            "final_rationales": final_rationales,
+            "skipped_turns": skipped_turns,
             "group_outcome": plurality(list(final_votes.values())),
             "model_group_outcome": plurality([final_votes[name] for name in model_names]),
             "model_calls": self.calls,
             "invalid_calls": self.invalid_calls,
             "usage": self.usage,
+            "calls": self.call_log,
         }
 
 

@@ -1,7 +1,6 @@
 """Single entry point.
 
   python3 run.py --plan                       show the trial grid and call budget, no calls
-  python3 run.py --fake                       full offline run with a fake model (no keys)
   python3 run.py --api                        real run through an OpenAI-compatible API
   python3 run.py --hf                         real run with a local Hugging Face model (CPU)
   python3 run.py --gpu                        same, on CUDA GPUs (implies --hf)
@@ -11,7 +10,7 @@
   python3 run.py --vllm-url http://host:8000  use a vLLM server that is already running
   python3 run.py --limit 5                    run only the first 5 trials (smoke test)
 
-With none of --fake, --api, --hf and --vllm, the backend named by llm.backend in config.json is
+With none of --api, --hf and --vllm, the backend named by llm.backend in config.json is
 used (default: api).
 """
 
@@ -34,7 +33,6 @@ def main() -> None:
     parser.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                          "config.json"))
     backend = parser.add_mutually_exclusive_group()
-    backend.add_argument("--fake", action="store_true", help="use the offline fake model")
     backend.add_argument("--api", action="store_true",
                          help="use an OpenAI-compatible API (base_url, api_key, model)")
     backend.add_argument("--hf", action="store_true",
@@ -63,13 +61,16 @@ def main() -> None:
         return
     chosen = "api" if args.api else "hf" if args.hf else "vllm" if args.vllm else None
     try:
-        resolve_backend(None, args.fake, chosen, args.gpu, args.hf_model, args.vllm_model,
+        resolve_backend(None, chosen, args.gpu, args.hf_model, args.vllm_model,
                         args.vllm_url, args.tensor_parallel_size)
     except ValueError as error:
         parser.error(str(error))
-    run(args.config, fake=args.fake, limit=args.limit, output_dir=args.output_dir,
-        backend=chosen, gpu=args.gpu, hf_model=args.hf_model, vllm_model=args.vllm_model,
-        vllm_url=args.vllm_url, tensor_parallel_size=args.tensor_parallel_size)
+    try:
+        run(args.config, limit=args.limit, output_dir=args.output_dir,
+            backend=chosen, gpu=args.gpu, hf_model=args.hf_model, vllm_model=args.vllm_model,
+            vllm_url=args.vllm_url, tensor_parallel_size=args.tensor_parallel_size)
+    except KeyboardInterrupt:
+        raise SystemExit(130)  # partial results were already saved by run()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-# Only needed for --hf / --gpu (local Hugging Face models). The offline fake backend, --api and
-# the tests need no packages at all and run on Python 3.9+. These packages need Python 3.10+.
+# Only needed for --hf / --gpu (local Hugging Face models). --api and --vllm need no packages at
+# all and run on Python 3.9+. These packages need Python 3.10+.
 #   pip install -r requirements.txt
 # vLLM (--vllm) is NOT listed here: it depends on a specific torch version, so install it
 # separately with `pip install vllm`, preferably in its own environment.

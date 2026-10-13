@@ -4,19 +4,16 @@ A runnable simulation of how a group of LLM agents is influenced by other partic
 all metrics computed from structured model outputs (no LLM judge). It runs two experiments on
 three risk-classified decision scenarios, at 1, 2 and 3 discussion rounds, from one command.
 
-- Four model backends: an OpenAI-compatible **API** (`--api`), a local **Hugging Face** model on
-  CPU (`--hf`) or on GPUs (`--gpu`), a **vLLM** server (`--vllm`), and an offline **fake** model for
-  testing (`--fake`).
-- The API, vLLM and fake backends use only the standard library (Python 3.9+); vLLM just needs its
+- Three model backends: an OpenAI-compatible **API** (`--api`), a local **Hugging Face** model on
+  CPU (`--hf`) or on GPUs (`--gpu`), and a **vLLM** server (`--vllm`).
+- The API and vLLM backends use only the standard library (Python 3.9+); vLLM just needs its
   own `vllm` command installed. The Hugging Face backend needs `pip install -r requirements.txt`
   and Python 3.10+.
 - API settings are blank by default. Whoever runs it fills them in (see [Setup](#2-setup)).
 
-**Status.** Verified offline: the unit tests pass and the full grid runs end to end with the
-built-in fake model. The Hugging Face backend is covered by tests that use stand-ins for `torch`
-and `transformers`, and the vLLM backend by tests that run a stand-in for `vllm serve`. Neither
-has been run against a **real model or a real vLLM**, and no live API run has been performed
-either.
+**Status.** The code has been exercised end to end only against a stand-in HTTP server that
+returns valid replies. It has **not** been run against a real model, a real vLLM or a live API,
+so treat the first real run as the real test (start with `--limit 5`).
 
 ## Contents
 
@@ -31,7 +28,7 @@ either.
 9. [Output files](#9-output-files)
 10. [Configuration reference](#10-configuration-reference)
 11. [Cost and call budget](#11-cost-and-call-budget)
-12. [Extending and testing](#12-extending-and-testing)
+12. [Extending](#12-extending)
 13. [Repository layout](#13-repository-layout)
 
 ---
@@ -43,7 +40,6 @@ git clone https://github.com/abhilekhborah/mas-belief-simulation.git
 cd mas-belief-simulation
 
 python3 run.py --plan                   # print the trial grid and call budget; no model calls
-python3 run.py --fake                   # complete offline run with a fake model; needs no key
 python3 run.py --api                    # full run through an OpenAI-compatible API
 python3 run.py --hf                     # full run with a local Hugging Face model on CPU
 python3 run.py --gpu                    # the same model on CUDA GPUs (implies --hf)
@@ -52,11 +48,10 @@ python3 run.py --vllm                   # full run through vLLM; starts `vllm se
 python3 run.py --vllm --tensor-parallel-size 2   # vLLM spread over 2 GPUs
 python3 run.py --vllm-url http://HOST:8000       # use a vLLM server that is already running
 python3 run.py --api --limit 5          # smoke test: only the first 5 trials, any backend
-python3 -m unittest discover -s tests   # 58 unit and end-to-end tests
 ```
 
-`--fake` produces random but schema-valid replies. It exists to test the software; **its
-numbers are not results**.
+Each run saves everything to its own timestamped folder under `runs/`; see
+[Output files](#9-output-files).
 
 The backend flags are mutually exclusive. `--gpu` and `--hf-model` imply `--hf`; `--vllm-model`,
 `--vllm-url` and `--tensor-parallel-size` imply `--vllm`. Mixing the two families is an error. With
@@ -69,7 +64,7 @@ Other flags: `--config PATH` (use another config file) and `--output-dir PATH`.
 
 ## 2. Setup
 
-Choose one backend. `--api`, `--hf`, `--gpu`, `--vllm` and `--fake` select it on the command line;
+Choose one backend. `--api`, `--hf`, `--gpu` and `--vllm` select it on the command line;
 otherwise `llm.backend` in [`config.json`](config.json) decides (default `api`).
 
 ### Option A: API (`--api`)
@@ -190,9 +185,9 @@ flowchart TD
     B --> C["Verify every scenario answer key"]
     C --> D["Build the trial grid"]
     D --> E["Run trials, up to parallel_trials at a time, or one at a time for a local model"]
-    E --> F["Append each trial to trials.jsonl, each call to calls.jsonl"]
-    F --> G["Compute metrics from all finished trials"]
-    G --> H["Write summary, contrasts, trajectories"]
+    E --> F["Save each finished trial to trials.partial.jsonl"]
+    F --> G["Compute scores from all finished trials"]
+    G --> H["Write results.json and the CSV tables, add a line to history.jsonl"]
 ```
 
 1. **Config and backend.** [`runner.py`](mas_sim/runner.py) reads the config, applies
@@ -208,20 +203,23 @@ flowchart TD
    ([`engine.py`](mas_sim/engine.py)). Inside a trial the speaking order is sequential;
    different trials run in parallel, except with a local Hugging Face model, which handles one
    call at a time.
-5. **Logging.** Every call attempt, including retries and invalid replies, is appended to
-   `calls.jsonl` as it happens. Each finished trial is appended to `trials.jsonl`.
-6. **Metrics.** After all trials finish, [`metrics.py`](mas_sim/metrics.py) computes the
-   summary files. If a trial raises an exception, it is recorded under `failed_trials` in
-   `summary.json` and the rest continue. The command still exits normally, so check the
-   final "N failed" line.
+5. **Logging.** Every call attempt, including retries and invalid replies, is kept inside its
+   trial record (full prompt and raw reply). Each finished trial is also appended to
+   `trials.partial.jsonl` straight away, so a crash loses at most the trials in flight.
+6. **Scores and saving.** When the run ends, [`metrics.py`](mas_sim/metrics.py) computes the
+   scores and [`runner.py`](mas_sim/runner.py) writes `results.json`, the CSV tables and a line
+   in `runs/history.jsonl` (see [section 9](#9-output-files)). This also happens after Ctrl-C or
+   `kill` (the run is then marked `interrupted`) and after a crash (`failed`). If one trial
+   raises an exception, it is listed under `failed_trials` and the rest continue. The command
+   still exits normally, so check the final "N failed" line.
 
 Console output looks like:
 
 ```text
-Running 108 trials with fake-offline -> .../runs/20261012T003840-fake
+Running 108 trials with vllm:Qwen/Qwen3.8-27B -> .../runs/20261012T003840_vllm
   10/108 trials finished
   ...
-Done: 108 trials completed, 0 failed. Outputs in .../runs/20261012T003840-fake
+Run completed: 108 of 108 trials completed, 0 failed. Results: .../runs/20261012T003840_vllm/results.json
 ```
 
 ## 4. The two experiments
@@ -402,7 +400,7 @@ Keep your response concise, just one or two sentences.
 ```
 
 Agents are never told which participants are scripted, that facts differ between agents, or
-anything about the experiment's hypotheses. A test checks the prompt for evaluator words such
+anything about the experiment's hypotheses. The prompts contain no evaluator words such
 as "decoy", "script" and "minority".
 
 **The four user prompts** (each is appended after the system prompt as its own request):
@@ -504,27 +502,106 @@ PY
 
 ## 9. Output files
 
-Each run writes `runs/<timestamp>/` (`-fake`, `-hf` or `-vllm` is appended for offline,
-local-model or vLLM runs; the location is relative to the config file unless `--output-dir` is
-given).
+Every run writes its own folder, named after when it **started** (local time) and the backend, so
+run names never repeat and old runs are never overwritten. The location is relative to the config
+file unless `--output-dir` is given.
+
+```text
+runs/
+  history.jsonl                  one line per run, added after every run (the run log)
+  20261012T003840_vllm/          <YYYYMMDDTHHMMSS>_<api|hf|vllm>
+    results.json                 everything about this run: scores and every prompt and reply
+    summary.csv                  scores per condition (open in a spreadsheet)
+    contrasts.csv                matched differences between conditions
+    trajectories.csv             every probability report of every model agent
+    vllm_server.log              only when this run started the vLLM server
+```
 
 | File | Contents |
 |---|---|
+| `results.json` | The complete record of the run, described below. If you keep one file, keep this one |
 | `summary.csv` | One row per condition (`experiment, scenario, composition, arm, info_mode, rounds`), plus pooled rows with `scenario = ALL`. Columns are the metrics above plus `trials`, `model_calls`, `invalid_calls`. Default grid: 144 rows (108 + 36 pooled) |
 | `contrasts.csv` | Matched differences. For minority conversion: `consistent_wrong - truthful_sham` and `consistent_wrong - no_script` (`diff_*` columns). For hidden profile: pooling gain (final minus initial accuracy), remaining gap to `full`, and the `reveal_all` result. Columns that do not apply to a row are empty. Default: 84 rows |
 | `trajectories.csv` | One row per probability report of every model agent: `trial_id`, condition fields, `agent`, `slot` (0-based speaking position; scripts come first), `stage` (`baseline`, `pre_turn`, `terminal`), `round`, `probe_order`, `view_length`, `valid`, `p_A` to `p_D`, `p_correct`, `p_target`, `private_top`, `correct`, `target` |
-| `trials.jsonl` | One record per trial: ids and condition, `letters` (letter to option name), `correct`, `target`, `decoy`, `script_answer`, `ground_truth_audit`, MIT risk tags, `participants` (kind and unique facts), `probes`, `public` transcript, `disclosures`, `initial_votes`, `final_votes`, `group_outcome`, `model_group_outcome`, `model_calls`, `invalid_calls`, `usage` |
-| `calls.jsonl` | Every call attempt: `trial_id`, `agent`, `call_kind`, `stage`, `round`, `attempt`, full `messages`, raw `response`, `valid`, `errors`, `latency_seconds` |
 | `vllm_server.log` | Only for `--vllm` runs that start the server: its output, for diagnosing start-up problems |
-| `summary.json` | `summary`, `contrasts` and `failed_trials` (trials that raised an exception) |
-| `run_config.json` | The settings used, including `backend`, `gpu` and the client name, with the API key removed |
+
+### `results.json`
+
+One JSON file per run (UTF-8, indented, written atomically so it is never half-written).
+Timestamps are ISO 8601 in local time with the UTC offset, e.g. `2026-10-12T00:38:40+05:30`.
+
+| Key | Contents |
+|---|---|
+| `schema_version` | Format version of this file (currently `1`) |
+| `run` | Run details: `run_id` (the folder name), `status` (`completed`, `interrupted` or `failed`), `started_at`, `finished_at`, `duration_seconds`, `backend`, `client`, `model`, `gpu`, `command` (the exact command line), `trials_planned`, `trials_completed`, `trials_failed`, `model_calls`, `invalid_calls`, `usage` (token totals, when the backend reports them), `config` (the settings used, with the API key and header values removed) |
+| `summary` | The same rows as `summary.csv`: scores per condition and pooled |
+| `contrasts` | The same rows as `contrasts.csv` |
+| `failed_trials` | Trials that raised an exception: `trial_id` and `error` |
+| `trials` | One record per finished trial, in grid order, described next |
+
+Each entry of `trials` contains:
+
+| Field | Contents |
+|---|---|
+| `trial_id`, `experiment`, `scenario`, `item`, `repeat`, `composition`, `arm`, `info_mode`, `rounds`, `rotation` | Which condition this trial is |
+| `started_at`, `finished_at` | When this trial began and ended |
+| `letters`, `correct`, `target`, `decoy`, `script_answer`, `ground_truth_audit`, `mit_risk_primary`, `mit_risk_hidden_mechanism` | Option letters (letter to option name), the correct and target options, and the computed ground truth |
+| `participants`, `evidence` | Who took part (model or script) and exactly which facts each person was shown |
+| `probes` | Every private probability report: `agent`, `stage` (`baseline`, `pre_turn`, `terminal`), `round`, `belief` (probabilities for A to D), `peer_forecasts`, `group_forecast` |
+| `public` | The public transcript, in order: `round`, `speaker`, `kind` (model or script), `answer`, `message` |
+| `disclosures` | Facts shared during the discussion (hidden-profile experiment) |
+| `initial_votes`, `initial_rationales`, `final_votes`, `final_rationales` | Each person's vote before and after the discussion, with their written reason |
+| `group_outcome`, `model_group_outcome`, `skipped_turns` | Plurality result (all participants, and model agents only) and turns skipped after repeated invalid replies |
+| `scores` | The same metrics as `summary.csv`, computed for this one trial |
+| `calls` | **Every model call**, including retries and invalid replies: `call_number`, `timestamp`, `agent`, `call_kind`, `stage`, `round`, `attempt`, the full `messages` sent, the raw `response`, `valid`, `errors`, `latency_seconds` |
+| `model_calls`, `invalid_calls`, `usage` | Call and token counts for this trial |
 
 `trial_id` has the form
 `experiment/scenario/item<i>/rep<r>/<composition>/<arm>/<info_mode>/R<rounds>`. Experiment 2
 trials use composition `4+0` and arm `none`.
 
-Trials are appended to `trials.jsonl` as they finish, but the summary files are written only at
-the end. There is no resume: after an interrupted run, start a new one.
+A full default run produces a `results.json` of roughly 20 to 60 MB because it contains every
+prompt. To read it without loading everything by hand:
+
+```bash
+python3 - runs/<run folder>/results.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["run"]["status"], d["run"]["model"], d["run"]["started_at"])
+trial = d["trials"][0]
+print(trial["trial_id"], trial["scores"]["final_vote_accuracy"])
+for call in trial["calls"][:2]:
+    print(call["agent"], call["call_kind"], "->", call["response"][:80])
+PY
+```
+
+### `history.jsonl`
+
+`runs/history.jsonl` is a log of every run, one JSON object per line, appended when a run ends
+(including interrupted and failed runs). Each line has `run_id`, `status`, `started_at`,
+`finished_at`, `duration_seconds`, `backend`, `model`, `trials_planned`, `trials_completed`,
+`trials_failed`, `model_calls`, `invalid_calls`, `results_file` (path of that run's
+`results.json` relative to `runs/`) and `headline` (per experiment: `trials`, vote accuracy before
+and after, `conversion_rate`, `compliance_rate`, mean probability change, group-forecast Brier).
+Use it to compare runs without opening the big files:
+
+```bash
+python3 - <<'PY'
+import json
+for line in open("runs/history.jsonl"):
+    r = json.loads(line)
+    print(r["started_at"], r["backend"], r["model"], r["status"],
+          f'{r["trials_completed"]}/{r["trials_planned"]}', f'{r["duration_seconds"]}s')
+PY
+```
+
+### While the run is going
+
+Each finished trial is also appended to `trials.partial.jsonl` in the run folder as it finishes.
+That file is deleted once `results.json` has been written, so you only ever see it if the process
+was killed without a chance to save (`kill -9`, power loss), in which case it holds every trial
+that had finished. After Ctrl-C or a normal `kill`, `results.json` is still written and marked
+`interrupted`. There is no resume: after an interrupted run, start a new one.
 
 ## 10. Configuration reference
 
@@ -535,7 +612,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `backend` | `api` | `api`, `hf`, `vllm` or `fake`. A command-line flag (`--api`, `--hf`, `--gpu`, `--vllm`, `--fake`) overrides it |
+| `backend` | `api` | `api`, `hf` or `vllm`. A command-line flag (`--api`, `--hf`, `--gpu`, `--vllm`) overrides it |
 | `base_url`, `api_key`, `model` | blank | Required for the `api` backend |
 | `temperature` | `0.7` | Sampling temperature; `null` omits it from API requests. For `hf`, `null` or `0` means greedy decoding |
 | `max_tokens` | `800` | Reply length cap, also used by `hf` unless `llm.hf.max_new_tokens` is set; raise it if replies are cut off |
@@ -544,7 +621,6 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `timeout_seconds` | `120` | Per-request timeout |
 | `max_http_retries` | `3` | Retries with backoff on network errors and HTTP 408, 409, 429, 5xx. Other 4xx errors fail at once |
 | `extra_body`, `extra_headers` | `{}` | Merged into every request, for provider-specific settings |
-| `fake_invalid_rate` | `0.0` | Offline only: fraction of fake replies that are invalid, to test the retry path |
 
 `base_url`, `api_key`, `model`, `max_tokens_field`, `json_mode`, `timeout_seconds`,
 `max_http_retries`, `extra_body` and `extra_headers` apply only to the API backend.
@@ -576,7 +652,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `reasoning_parser` | `qwen3` | Passed as `--reasoning-parser`, only when `enable_thinking` is true |
 | `top_p`, `top_k`, `repetition_penalty` | `0.8`, `20`, `1.0` | Sampling fields added to each request; `null` omits one, and a penalty of `1.0` is not sent |
 | `trust_remote_code` | `false` | Passes `--trust-remote-code` to the server |
-| `api_key` | empty | Only for a server started with `--api-key`; otherwise a placeholder is sent. Never written to `run_config.json` |
+| `api_key` | empty | Only for a server started with `--api-key`; otherwise a placeholder is sent. Never written to `results.json` |
 | `command` | `["vllm"]` | Program that provides `serve`. Used as is if it is not `vllm`; if `vllm` sits next to the Python interpreter (a virtual environment), that one is used |
 | `extra_args` | `[]` | Extra command-line arguments appended to `vllm serve`, for example `["--enable-prefix-caching"]` |
 | `startup_timeout_seconds` | `1800` | How long to wait for the server to become healthy |
@@ -585,7 +661,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 
 The `vllm` backend also uses `llm.temperature`, `llm.max_tokens`, `llm.max_tokens_field`,
 `llm.json_mode`, `llm.timeout_seconds`, `llm.max_http_retries`, `llm.extra_body` and
-`llm.extra_headers`, with the same meaning as for the API backend. `run_config.json` hides header
+`llm.extra_headers`, with the same meaning as for the API backend. `results.json` hides header
 values and every API key.
 
 **`run`**
@@ -647,45 +723,25 @@ For a broader first run, make a copy of the config with a smaller grid, for exam
 ```
 
 That is 4 trials and 96 calls. Token use is not estimated here; when the provider returns
-usage (the local Hugging Face backend always does), it is summed per trial in `trials.jsonl`.
+usage (the local Hugging Face backend always does), it is summed per trial and per run in `results.json`.
 
-## 12. Extending and testing
+## 12. Extending
 
 **Add a scenario** in [`scenarios.py`](mas_sim/scenarios.py): define `Fact` objects whose
 `claims` are `(relation, subject, value)` triples, write a `decide(knowledge)` function that
 returns a `Decision`, build a `Scenario` with four options in canonical order (decoy, target,
 correct, excluded) and four critical facts (the first two exclude the decoy, the last two the
-target), and add it to `SCENARIOS`. `verify_all()` then enforces the design rules, and the
-test suite checks every registered scenario. Add its key to `scenarios` in the config.
+target), and add it to `SCENARIOS`. `verify_all()` then enforces the design rules at the start of
+every run. Add its key to `scenarios` in the config.
 
 **Change conditions** by editing the config; no code changes are needed for compositions,
 arms, rounds, information modes, repeats or items.
-
-**Tests** ([`tests/test_simulation.py`](tests/test_simulation.py), `python3 -m unittest
-discover -s tests`) cover: scenario verification, computed ground truth, letter rotation,
-prompt leakage, Brier and plurality, conversion and compliance counting, hidden fact
-allocation, and a full offline run that checks every output file exists and the API key is
-absent.
-
-[`tests/test_hf_backend.py`](tests/test_hf_backend.py) covers the Hugging Face backend with
-stand-ins for `torch` and `transformers`, so it runs without them and never loads a model:
-backend selection and flag conflicts, chat-template arguments, sampling versus greedy settings,
-decoding of only the new tokens, removal of reasoning blocks, GPU handling, the install hint when
-packages are missing, and one-call-at-a-time execution.
-
-[`tests/test_vllm_backend.py`](tests/test_vllm_backend.py) covers the vLLM backend with a small
-stand-in program that behaves like `vllm serve` (a health endpoint and a chat endpoint), so it
-runs without vLLM or a GPU: the command line that is built, the request body, waiting for the
-server to become healthy, a server that exits early or never becomes ready, a missing `vllm`
-command, connecting to an existing server without stopping it, stopping the server it started
-(including at the end of a run), and keys being kept out of `run_config.json`. It checks this
-program's own logic, not vLLM itself.
 
 ## 13. Repository layout
 
 ```text
 simulation/
-  run.py                  entry point (--plan, --fake, --api, --hf, --gpu, --hf-model, --vllm,
+  run.py                  entry point (--plan, --api, --hf, --gpu, --hf-model, --vllm,
                           --vllm-model, --vllm-url, --tensor-parallel-size, --limit, --config,
                           --output-dir)
   config.json             all settings; API fields blank
@@ -693,13 +749,10 @@ simulation/
   mas_sim/
     scenarios.py          facts, rules, computed ground truth, verification, letter rotation
     prompts.py            system and user prompt templates, transcript format
-    llm.py                API, Hugging Face and vLLM clients, offline fake client, JSON extraction
+    llm.py                API, Hugging Face and vLLM clients, JSON extraction
     engine.py             trial runner, reply validation, plurality, unique-top helper
     experiments.py        theory notes and the trial grid builder, call budget
     metrics.py            all metrics, contrasts, trajectory rows
     runner.py             config loading, parallel execution, output writing
-  tests/test_simulation.py
-  tests/test_hf_backend.py
-  tests/test_vllm_backend.py
   runs/                   created at run time; ignored by git
 ```

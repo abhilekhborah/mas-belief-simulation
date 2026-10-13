@@ -1,5 +1,4 @@
-"""Model clients: an OpenAI-compatible HTTP client, a local Hugging Face client, a vLLM client,
-and an offline fake.
+"""Model clients: an OpenAI-compatible HTTP client, a local Hugging Face client and a vLLM client.
 
 The HTTP client uses only the standard library and works with any provider
 exposing an OpenAI-style ``POST {base_url}/chat/completions`` endpoint. The
@@ -16,18 +15,13 @@ extra Python packages here; the ``vllm`` command only has to be installed. It ei
 starts ``vllm serve`` itself on a free local port and stops it afterwards, or connects
 to a server that is already running. Because vLLM batches concurrent requests, trials
 run in parallel on this backend.
-
-The fake client returns random but schema-valid JSON. It exists only to test
-the pipeline without keys; its outputs carry no scientific meaning.
 """
 
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import os
-import random
 import shutil
 import signal
 import socket
@@ -40,9 +34,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
-
-from .prompts import GROUP_OUTCOMES
-from .scenarios import LETTERS
 
 
 @dataclass
@@ -114,49 +105,9 @@ class OpenAICompatibleClient:
         raise ModelError(f"request failed after retries: {last_error}")
 
 
-def _random_distribution(rng: random.Random, keys: Sequence[str]) -> Dict[str, float]:
-    cuts = sorted(rng.randint(0, 100) for _ in range(len(keys) - 1))
-    parts = [high - low for low, high in zip([0] + cuts, cuts + [100])]
-    return {key: part / 100 for key, part in zip(keys, parts)}
-
-
-class FakeClient:
-    """Offline client producing schema-valid random JSON for pipeline tests."""
-
-    def __init__(self, seed: int = 0, invalid_rate: float = 0.0) -> None:
-        self.seed = seed
-        self.invalid_rate = invalid_rate
-
-    @property
-    def name(self) -> str:
-        return "fake-offline"
-
-    def complete(self, messages: List[Dict[str, str]], spec: Dict) -> Completion:
-        digest = hashlib.sha256(
-            (str(self.seed) + json.dumps(messages, sort_keys=True)).encode("utf-8")
-        ).hexdigest()
-        rng = random.Random(digest)
-        if rng.random() < self.invalid_rate:
-            return Completion("not json")
-        kind = spec["call_kind"]
-        if kind == "private_probe":
-            payload: Dict = {"private_belief": _random_distribution(rng, LETTERS)}
-            if spec.get("peers"):
-                payload["peer_forecasts"] = {
-                    peer: _random_distribution(rng, LETTERS) for peer in spec["peers"]
-                }
-            if spec.get("ask_group"):
-                payload["group_forecast"] = _random_distribution(rng, GROUP_OUTCOMES)
-        elif kind == "public_turn":
-            payload = {"public_answer": rng.choice(LETTERS), "public_message": "I have a view."}
-        else:
-            payload = {"vote": rng.choice(LETTERS), "rationale": "Based on the facts."}
-        return Completion(json.dumps(payload))
-
-
 DEFAULT_HF_MODEL = "Qwen/Qwen3.8-27B"
 DEFAULT_VLLM_MODEL = DEFAULT_HF_MODEL
-BACKENDS = ("api", "hf", "vllm", "fake")
+BACKENDS = ("api", "hf", "vllm")
 
 
 def strip_thinking(text: str, started_in_prompt: bool = False) -> str:
@@ -462,29 +413,26 @@ class VLLMClient(OpenAICompatibleClient):
         return completion
 
 
-def resolve_backend(config_backend: Optional[str], fake: bool = False, backend: Optional[str] = None,
+def resolve_backend(config_backend: Optional[str], backend: Optional[str] = None,
                     gpu: bool = False, hf_model: Optional[str] = None,
                     vllm_model: Optional[str] = None, vllm_url: Optional[str] = None,
                     tensor_parallel_size: Optional[int] = None) -> str:
     """Pick the backend: explicit choice, else implied by a backend-specific flag, else config."""
-    chosen = [name for name in ("fake" if fake else None, backend) if name]
-    if len(set(chosen)) > 1:
-        raise ValueError("choose only one of --fake, --api, --hf and --vllm")
-    explicit = chosen[0] if chosen else None
+    explicit = backend
     hf_flags = bool(gpu or hf_model)
     vllm_flags = bool(vllm_model or vllm_url or tensor_parallel_size)
     if hf_flags and vllm_flags:
         raise ValueError("--gpu and --hf-model belong to --hf; --vllm-model, --vllm-url and "
                          "--tensor-parallel-size belong to --vllm. Do not mix them")
     if hf_flags:
-        if explicit in ("api", "fake", "vllm"):
+        if explicit in ("api", "vllm"):
             raise ValueError("--gpu and --hf-model apply only to the Hugging Face backend, "
-                             "not to --api, --vllm or --fake")
+                             "not to --api or --vllm")
         explicit = "hf"
     if vllm_flags:
-        if explicit in ("api", "fake", "hf"):
+        if explicit in ("api", "hf"):
             raise ValueError("--vllm-model, --vllm-url and --tensor-parallel-size apply only to "
-                             "the vLLM backend, not to --api, --hf or --fake")
+                             "the vLLM backend, not to --api or --hf")
         explicit = "vllm"
     resolved = explicit or config_backend or "api"
     if resolved not in BACKENDS:
@@ -496,8 +444,6 @@ def build_client(settings: Dict, backend: str, seed: int, gpu: bool = False,
                  hf_model: Optional[str] = None, vllm_model: Optional[str] = None,
                  vllm_url: Optional[str] = None, tensor_parallel_size: Optional[int] = None,
                  log_dir: Optional[str] = None):
-    if backend == "fake":
-        return FakeClient(seed=seed, invalid_rate=float(settings.get("fake_invalid_rate", 0.0)))
     if backend == "vllm":
         vllm = dict(settings.get("vllm", {}))
         if vllm_model:
@@ -516,8 +462,8 @@ def build_client(settings: Dict, backend: str, seed: int, gpu: bool = False,
     if missing:
         raise SystemExit(
             "Missing LLM settings: " + ", ".join(missing) + ". Fill them in config.json "
-            "(or set MAS_BASE_URL / MAS_API_KEY / MAS_MODEL), or run with --fake for an offline "
-            "test, --hf for a local Hugging Face model or --vllm for a vLLM server."
+            "(or set MAS_BASE_URL / MAS_API_KEY / MAS_MODEL), or use --hf for a local "
+            "Hugging Face model or --vllm for a vLLM server."
         )
     return OpenAICompatibleClient(settings)
 

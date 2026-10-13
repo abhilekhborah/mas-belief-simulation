@@ -1,5 +1,5 @@
 {
-  "_comment": "Pick a backend with llm.backend or with --api / --hf / --gpu / --vllm / --fake on the command line. api: fill llm.base_url, llm.api_key and llm.model (or set MAS_BASE_URL, MAS_API_KEY, MAS_MODEL); any OpenAI-compatible /chat/completions endpoint works. hf: runs a local Hugging Face model, see llm.hf. vllm: starts (or connects to) a vLLM server, see llm.vllm. Do not commit a real key.",
+  "_comment": "Pick a backend with llm.backend or with --api / --hf / --gpu / --vllm on the command line. api: fill llm.base_url, llm.api_key and llm.model (or set MAS_BASE_URL, MAS_API_KEY, MAS_MODEL); any OpenAI-compatible /chat/completions endpoint works. hf: runs a local Hugging Face model, see llm.hf. vllm: starts (or connects to) a vLLM server, see llm.vllm. Do not commit a real key.",
   "llm": {
     "backend": "api",
     "base_url": "",
@@ -43,8 +43,7 @@
       "startup_timeout_seconds": 1800,
       "startup_poll_seconds": 2,
       "stop_timeout_seconds": 30
-    },
-    "fake_invalid_rate": 0.0
+    }
   },
   "run": {
     "output_dir": "runs",
