@@ -4,11 +4,16 @@ A runnable simulation of how a group of LLM agents is influenced by other partic
 all metrics computed from structured model outputs (no LLM judge). It runs two experiments on
 three risk-classified decision scenarios, at 1, 2 and 3 discussion rounds, from one command.
 
-- Standard library only; Python 3.9+. No packages to install.
+- Three model backends: an OpenAI-compatible **API** (`--api`), a local **Hugging Face** model on
+  CPU (`--hf`) or on GPUs (`--gpu`), and an offline **fake** model for testing (`--fake`).
+- The API and fake backends use only the standard library (Python 3.9+). The Hugging Face backend
+  needs `pip install -r requirements.txt` and Python 3.10+.
 - API settings are blank by default. Whoever runs it fills them in (see [Setup](#2-setup)).
 
 **Status.** Verified offline: the unit tests pass and the full grid runs end to end with the
-built-in fake model. No live-model run has been performed.
+built-in fake model. The Hugging Face backend is covered by tests that use stand-ins for `torch`
+and `transformers`. It has **not been run against a real model**, and no live API run has been
+performed either.
 
 ## Contents
 
@@ -34,19 +39,32 @@ built-in fake model. No live-model run has been performed.
 git clone https://github.com/abhilekhborah/mas-belief-simulation.git
 cd mas-belief-simulation
 
-python3 run.py --plan      # print the trial grid and call budget; makes no model calls
-python3 run.py --fake      # complete offline run with a fake model; needs no key
-python3 run.py --limit 5   # real smoke test: only the first 5 trials
-python3 run.py             # the full real run
-python3 -m unittest discover -s tests   # 8 unit and end-to-end tests
+python3 run.py --plan                   # print the trial grid and call budget; no model calls
+python3 run.py --fake                   # complete offline run with a fake model; needs no key
+python3 run.py --api                    # full run through an OpenAI-compatible API
+python3 run.py --hf                     # full run with a local Hugging Face model on CPU
+python3 run.py --gpu                    # the same model on CUDA GPUs (implies --hf)
+python3 run.py --gpu --hf-model NAME    # choose another Hugging Face model
+python3 run.py --api --limit 5          # smoke test: only the first 5 trials, any backend
+python3 -m unittest discover -s tests   # 27 unit and end-to-end tests
 ```
 
 `--fake` produces random but schema-valid replies. It exists to test the software; **its
 numbers are not results**.
 
+The backend flags are mutually exclusive. `--gpu` and `--hf-model` imply `--hf`. With no backend
+flag, the backend named by `llm.backend` in [`config.json`](config.json) is used, which is `api`
+by default, so a bare `python3 run.py` is an API run. `--limit N` and `--plan` work with every
+backend.
+
 Other flags: `--config PATH` (use another config file) and `--output-dir PATH`.
 
 ## 2. Setup
+
+Choose one backend. `--api`, `--hf`, `--gpu` and `--fake` select it on the command line;
+otherwise `llm.backend` in [`config.json`](config.json) decides (default `api`).
+
+### Option A: API (`--api`)
 
 Set an OpenAI-compatible chat endpoint. Either edit `llm.base_url`, `llm.api_key` and
 `llm.model` in [`config.json`](config.json), or export environment variables, which take
@@ -62,12 +80,50 @@ Do not commit a real key. To keep settings in a file, copy `config.json` to
 `config.local.json` (already in [`.gitignore`](.gitignore)) and run
 `python3 run.py --config config.local.json`.
 
-If a real run starts with any of the three missing, it stops immediately with a message
+If the API backend starts with any of the three missing, it stops immediately with a message
 naming the missing setting. The API key is never written to any output file.
 
 Provider quirks: if the provider rejects `max_tokens`, set `llm.max_tokens_field` (for example
 `max_completion_tokens`); if it rejects `temperature`, set it to `null`. See
 [Configuration reference](#10-configuration-reference).
+
+### Option B: local Hugging Face model (`--hf`, `--gpu`)
+
+Runs the model inside this process with `transformers`. No API key or server is needed. It
+requires Python 3.10 or newer and the packages in [`requirements.txt`](requirements.txt).
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 run.py --gpu                                # default model on CUDA GPUs
+python3 run.py --hf                                 # same model on CPU
+python3 run.py --gpu --hf-model Qwen/Qwen3.6-27B    # another model id or a local folder
+```
+
+On a GPU machine, install the CUDA build of PyTorch that matches your driver first
+([instructions](https://pytorch.org/get-started/locally/)), then run
+`pip install -r requirements.txt`.
+
+- **Model.** The default is `Qwen/Qwen3.8-27B` (`llm.hf.model`). If it is unavailable, use
+  `Qwen/Qwen3.6-27B`. Both exist on Hugging Face and are not gated (checked 2026-10-14), and both
+  use the Qwen3.5 architecture. `--hf-model NAME` takes any model id or local path and implies
+  `--hf`.
+- **GPU.** `--gpu` loads the weights with `device_map="auto"`, which spreads the model across all
+  visible CUDA GPUs (limit them with `CUDA_VISIBLE_DEVICES`). If PyTorch cannot see a GPU, the run
+  stops with a message instead of silently using the CPU. Without `--gpu` everything runs on the
+  CPU, which is very slow for a 27B model.
+- **Size.** At about 2 bytes per parameter in bf16, 27B parameters need roughly 54 GB for the
+  weights alone, before activations (an estimate, not a measurement). The first run downloads the
+  weights to `~/.cache/huggingface`.
+- **One call at a time.** A single local model serves one request at a time, so trials run
+  sequentially and `parallel_trials` is ignored. A full grid is therefore long; check its size with
+  `--plan` and start with `--limit 5`.
+- **Reasoning mode.** `llm.hf.enable_thinking` is `false`, so replies are JSON only. If you turn it
+  on, the reasoning block is removed before parsing, and a reply whose reasoning is cut off by the
+  token limit counts as invalid (raise `max_new_tokens`).
+- **Sampling.** Uses `llm.temperature` with `top_p` and `top_k` from `llm.hf`. A temperature of
+  `null` or 0 means greedy decoding. `run.seed` seeds PyTorch before the model loads.
 
 ## 3. What happens when you run it
 
@@ -76,14 +132,15 @@ flowchart TD
     A["python3 run.py"] --> B["Load config.json, apply MAS_* env overrides"]
     B --> C["Verify every scenario answer key"]
     C --> D["Build the trial grid"]
-    D --> E["Run trials, up to parallel_trials at a time"]
+    D --> E["Run trials, up to parallel_trials at a time, or one at a time for a local model"]
     E --> F["Append each trial to trials.jsonl, each call to calls.jsonl"]
     F --> G["Compute metrics from all finished trials"]
     G --> H["Write summary, contrasts, trajectories"]
 ```
 
-1. **Config.** [`runner.py`](mas_sim/runner.py) reads the config and applies `MAS_BASE_URL`,
-   `MAS_API_KEY`, `MAS_MODEL`.
+1. **Config and backend.** [`runner.py`](mas_sim/runner.py) reads the config, applies
+   `MAS_BASE_URL`, `MAS_API_KEY`, `MAS_MODEL`, and builds the chosen model client
+   ([`llm.py`](mas_sim/llm.py)). For `--hf` this is where the model is loaded.
 2. **Answer-key check.** [`scenarios.py`](mas_sim/scenarios.py) verifies every scenario
    (see [section 5](#5-the-three-scenarios)). A scenario that fails stops the run before any
    model call.
@@ -91,7 +148,8 @@ flowchart TD
    default grid is **108 trials**: 81 for experiment 1 and 27 for experiment 2.
 4. **Trials.** Each trial runs independently in a fresh context
    ([`engine.py`](mas_sim/engine.py)). Inside a trial the speaking order is sequential;
-   different trials run in parallel.
+   different trials run in parallel, except with a local Hugging Face model, which handles one
+   call at a time.
 5. **Logging.** Every call attempt, including retries and invalid replies, is appended to
    `calls.jsonl` as it happens. Each finished trial is appended to `trials.jsonl`.
 6. **Metrics.** After all trials finish, [`metrics.py`](mas_sim/metrics.py) computes the
@@ -388,8 +446,8 @@ PY
 
 ## 9. Output files
 
-Each run writes `runs/<timestamp>/` (`-fake` is appended for offline runs; the location is
-relative to the config file unless `--output-dir` is given).
+Each run writes `runs/<timestamp>/` (`-fake` or `-hf` is appended for offline or local-model
+runs; the location is relative to the config file unless `--output-dir` is given).
 
 | File | Contents |
 |---|---|
@@ -399,7 +457,7 @@ relative to the config file unless `--output-dir` is given).
 | `trials.jsonl` | One record per trial: ids and condition, `letters` (letter to option name), `correct`, `target`, `decoy`, `script_answer`, `ground_truth_audit`, MIT risk tags, `participants` (kind and unique facts), `probes`, `public` transcript, `disclosures`, `initial_votes`, `final_votes`, `group_outcome`, `model_group_outcome`, `model_calls`, `invalid_calls`, `usage` |
 | `calls.jsonl` | Every call attempt: `trial_id`, `agent`, `call_kind`, `stage`, `round`, `attempt`, full `messages`, raw `response`, `valid`, `errors`, `latency_seconds` |
 | `summary.json` | `summary`, `contrasts` and `failed_trials` (trials that raised an exception) |
-| `run_config.json` | The settings used, with the API key removed |
+| `run_config.json` | The settings used, including `backend`, `gpu` and the client name, with the API key removed |
 
 `trial_id` has the form
 `experiment/scenario/item<i>/rep<r>/<composition>/<arm>/<info_mode>/R<rounds>`. Experiment 2
@@ -411,21 +469,37 @@ the end. There is no resume: after an interrupted run, start a new one.
 ## 10. Configuration reference
 
 All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY` and
-`MAS_MODEL` override the three `llm` fields of the same name.
+`MAS_MODEL` override the three `llm` fields of the same name, which only the API backend uses.
 
 **`llm`**
 
 | Key | Default | Meaning |
 |---|---|---|
-| `base_url`, `api_key`, `model` | blank | Required for a real run |
-| `temperature` | `0.7` | Sampling temperature; `null` omits it from requests |
-| `max_tokens` | `800` | Reply length cap; raise it if replies are cut off |
+| `backend` | `api` | `api`, `hf` or `fake`. A command-line flag (`--api`, `--hf`, `--gpu`, `--fake`) overrides it |
+| `base_url`, `api_key`, `model` | blank | Required for the `api` backend |
+| `temperature` | `0.7` | Sampling temperature; `null` omits it from API requests. For `hf`, `null` or `0` means greedy decoding |
+| `max_tokens` | `800` | Reply length cap, also used by `hf` unless `llm.hf.max_new_tokens` is set; raise it if replies are cut off |
 | `max_tokens_field` | `max_tokens` | Name of the cap field; some providers use `max_completion_tokens` |
 | `json_mode` | `false` | Adds `response_format: json_object` for providers that support it |
 | `timeout_seconds` | `120` | Per-request timeout |
 | `max_http_retries` | `3` | Retries with backoff on network errors and HTTP 408, 409, 429, 5xx. Other 4xx errors fail at once |
 | `extra_body`, `extra_headers` | `{}` | Merged into every request, for provider-specific settings |
 | `fake_invalid_rate` | `0.0` | Offline only: fraction of fake replies that are invalid, to test the retry path |
+
+`base_url`, `api_key`, `model`, `max_tokens_field`, `json_mode`, `timeout_seconds`,
+`max_http_retries`, `extra_body` and `extra_headers` apply only to the API backend.
+
+**`llm.hf`** (local Hugging Face backend)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `model` | `Qwen/Qwen3.8-27B` | Hub model id or local folder. `--hf-model NAME` overrides it |
+| `dtype` | `auto` | Passed to `from_pretrained`. `auto` uses the dtype stored with the model; or set e.g. `bfloat16` |
+| `enable_thinking` | `false` | Passed to the chat template. `false` turns Qwen's reasoning mode off |
+| `max_new_tokens` | `null` | Reply cap in generated tokens; `null` uses `llm.max_tokens` |
+| `top_p`, `top_k` | `0.8`, `20` | Used only when sampling (`llm.temperature` above 0); `null` omits one |
+| `repetition_penalty` | `1.0` | `1.0` turns it off |
+| `trust_remote_code` | `false` | Allows running code shipped inside the model repository; leave off unless a model needs it |
 
 **`run`**
 
@@ -435,7 +509,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `seed` | `20261012` | Seeds only the shuffle of fact order. Model sampling is not seeded, so real runs are not exactly reproducible |
 | `items_per_scenario` | `1` | Items per scenario. **Items rotate letters and fact ownership; they are not new cases** |
 | `repeats` | `1` | Repeats of every trial |
-| `parallel_trials` | `4` | Trials in flight at once. Lower it if the provider rate-limits you |
+| `parallel_trials` | `4` | Trials in flight at once. Lower it if the provider rate-limits you. Ignored (forced to 1) for local Hugging Face models |
 | `collect_forecasts` | `true` | Include forecasts in private probes. Set `false` to ask for beliefs only |
 | `max_parse_retries` | `2` | Correction retries for an invalid reply |
 | `probability_tolerance` | `1e-06` | How exactly probabilities must sum to 1 |
@@ -486,7 +560,7 @@ For a broader first run, make a copy of the config with a smaller grid, for exam
 ```
 
 That is 4 trials and 96 calls. Token use is not estimated here; when the provider returns
-usage, it is summed per trial in `trials.jsonl`.
+usage (the local Hugging Face backend always does), it is summed per trial in `trials.jsonl`.
 
 ## 12. Extending and testing
 
@@ -506,20 +580,29 @@ prompt leakage, Brier and plurality, conversion and compliance counting, hidden 
 allocation, and a full offline run that checks every output file exists and the API key is
 absent.
 
+[`tests/test_hf_backend.py`](tests/test_hf_backend.py) covers the Hugging Face backend with
+stand-ins for `torch` and `transformers`, so it runs without them and never loads a model:
+backend selection and flag conflicts, chat-template arguments, sampling versus greedy settings,
+decoding of only the new tokens, removal of reasoning blocks, GPU handling, the install hint when
+packages are missing, and one-call-at-a-time execution.
+
 ## 13. Repository layout
 
 ```text
 simulation/
-  run.py                  entry point (--plan, --fake, --limit, --config, --output-dir)
+  run.py                  entry point (--plan, --fake, --api, --hf, --gpu, --hf-model, --limit,
+                          --config, --output-dir)
   config.json             all settings; API fields blank
+  requirements.txt        extra packages, needed only for --hf / --gpu
   mas_sim/
     scenarios.py          facts, rules, computed ground truth, verification, letter rotation
     prompts.py            system and user prompt templates, transcript format
-    llm.py                OpenAI-compatible client, offline fake client, JSON extraction
+    llm.py                API client, local Hugging Face client, offline fake client, JSON extraction
     engine.py             trial runner, reply validation, plurality, unique-top helper
     experiments.py        theory notes and the trial grid builder, call budget
     metrics.py            all metrics, contrasts, trajectory rows
     runner.py             config loading, parallel execution, output writing
   tests/test_simulation.py
+  tests/test_hf_backend.py
   runs/                   created at run time; ignored by git
 ```

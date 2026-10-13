@@ -1,0 +1,10 @@
+# Only needed for --hf / --gpu (local Hugging Face models). The offline fake backend, --api and
+# the tests need no packages at all and run on Python 3.9+. These packages need Python 3.10+.
+#   pip install -r requirements.txt
+# For a GPU, install the CUDA build of torch that matches your driver first: https://pytorch.org/get-started/locally/
+torch
+# Qwen3.6 and Qwen3.8 27B use the Qwen3.5 architecture (Qwen3_5ForConditionalGeneration), which
+# needs a recent transformers. 5.8.0 is the version Qwen3.8-27B's own config was saved with.
+transformers>=5.8.0
+# Required for --gpu: places and shards the model across the visible GPUs.
+accelerate

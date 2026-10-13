@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence
 from . import metrics
 from .engine import EventSink, TrialRunner
 from .experiments import build_trials, planned_calls
-from .llm import build_client
+from .llm import build_client, resolve_backend
 from .scenarios import verify_all
 
 ENV_OVERRIDES = {"MAS_BASE_URL": "base_url", "MAS_API_KEY": "api_key", "MAS_MODEL": "model"}
@@ -51,30 +51,36 @@ def describe_plan(config: Dict) -> Dict:
 
 
 def run(config_path: str, fake: bool = False, limit: Optional[int] = None,
-        output_dir: Optional[str] = None) -> str:
+        output_dir: Optional[str] = None, backend: Optional[str] = None, gpu: bool = False,
+        hf_model: Optional[str] = None) -> str:
     verify_all()
     config = load_config(config_path)
     settings = {**config["llm"], **config["run"]}
     trials = build_trials(config)
     if limit is not None:
         trials = trials[:limit]
-    client = build_client(config["llm"], fake, int(config["run"]["seed"]))
+    chosen = resolve_backend(config["llm"].get("backend"), fake, backend, gpu, hf_model)
+    client = build_client(config["llm"], chosen, int(config["run"]["seed"]), gpu=gpu,
+                          hf_model=hf_model)
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
     base = output_dir or os.path.join(os.path.dirname(os.path.abspath(config_path)),
                                       config["run"].get("output_dir", "runs"))
-    run_dir = os.path.join(base, f"{stamp}{'-fake' if fake else ''}")
+    suffix = {"fake": "-fake", "hf": "-hf"}.get(chosen, "")
+    run_dir = os.path.join(base, f"{stamp}{suffix}")
     os.makedirs(run_dir, exist_ok=True)
     safe_llm = {key: value for key, value in config["llm"].items() if key != "api_key"}
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as handle:
-        json.dump({"llm": safe_llm, "run": config["run"], "fake": fake, "client": client.name,
-                   "trials": len(trials)}, handle, indent=2)
+        json.dump({"llm": safe_llm, "run": config["run"], "backend": chosen, "gpu": gpu,
+                   "client": client.name, "trials": len(trials)}, handle, indent=2)
 
     sink = EventSink(os.path.join(run_dir, "calls.jsonl"))
     trials_path = os.path.join(run_dir, "trials.jsonl")
     results: List[Dict] = []
     failures: List[Dict] = []
     workers = max(1, int(config["run"].get("parallel_trials", 1)))
+    if getattr(client, "serial", False):
+        workers = 1  # a single local model generates one reply at a time
     print(f"Running {len(trials)} trials with {client.name} -> {run_dir}")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(TrialRunner(trial, client, settings, sink).run): trial for trial in trials}

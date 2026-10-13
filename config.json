@@ -1,6 +1,7 @@
 {
-  "_comment": "Fill llm.base_url, llm.api_key and llm.model (or set MAS_BASE_URL, MAS_API_KEY, MAS_MODEL). Any OpenAI-compatible /chat/completions endpoint works. Do not commit a real key.",
+  "_comment": "Pick a backend with llm.backend or with --api / --hf / --gpu / --fake on the command line. api: fill llm.base_url, llm.api_key and llm.model (or set MAS_BASE_URL, MAS_API_KEY, MAS_MODEL); any OpenAI-compatible /chat/completions endpoint works. hf: runs a local Hugging Face model, see llm.hf. Do not commit a real key.",
   "llm": {
+    "backend": "api",
     "base_url": "",
     "api_key": "",
     "model": "",
@@ -12,6 +13,16 @@
     "max_http_retries": 3,
     "extra_body": {},
     "extra_headers": {},
+    "hf": {
+      "model": "Qwen/Qwen3.8-27B",
+      "dtype": "auto",
+      "enable_thinking": false,
+      "max_new_tokens": null,
+      "top_p": 0.8,
+      "top_k": 20,
+      "repetition_penalty": 1.0,
+      "trust_remote_code": false
+    },
     "fake_invalid_rate": 0.0
   },
   "run": {
