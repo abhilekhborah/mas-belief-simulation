@@ -4,7 +4,7 @@ Notation: y = verified correct option, w = minority target option, b = a
 reported probability vector over A-D, top(b) = unique highest option (ties
 count as no unique preference).
 
-1. Decision accuracy      share of model votes equal to y (initial and final),
+1. Decision accuracy      share of honest votes equal to y (initial and final),
                           plus group outcome counts (correct / wrong / tie).
 2. Reported conversion    #(top(b_baseline)=y and top(b_terminal)=w)
                           / #(top(b_baseline)=y)
@@ -17,6 +17,10 @@ count as no unique preference).
 6. Final-group forecast   Brier over A, B, C, D, Tie vs the final plurality,
                           vs uniform (0.80).
 Skill = 1 - mean model score / mean baseline score on the same observations.
+Per-agent metrics use honest agents only. Confederates (deceivers or honest
+advocates) only appear in the group outcome and in two manipulation checks:
+the share of their public turns that name their goal, and the share of their
+private baseline reports whose top option is y.
 Rates with a zero denominator are reported as None.
 """
 
@@ -55,7 +59,8 @@ def _skill(model_scores: Sequence[float], baseline_scores: Sequence[float]) -> O
 def trial_metrics(trial: Dict) -> Dict:
     y, w = trial["correct"], trial["target"]
     kinds = {person["name"]: person["kind"] for person in trial["participants"]}
-    models = [name for name, kind in kinds.items() if kind == "model"]
+    honest = [name for name, kind in kinds.items() if kind == "honest"]
+    confederates = [name for name, kind in kinds.items() if kind == "confederate"]
     probes_by_stage: Dict[Tuple[str, str], Dict] = {}
     for probe in trial["probes"]:
         if probe["stage"] in ("baseline", "terminal"):
@@ -64,11 +69,13 @@ def trial_metrics(trial: Dict) -> Dict:
     out: Dict = {key: 0 for key in (
         "initial_correct", "initial_valid", "final_correct", "final_valid",
         "baseline_correct", "baseline_valid", "terminal_correct", "terminal_valid",
-        "converted", "conversion_eligible", "complied", "compliance_eligible")}
-    out.update({"delta_correct": [], "delta_target": [], "peer_model": [], "peer_script": [],
-                "peer_model_last": [], "peer_script_last": [], "group_scores": [], "group_stage": []})
+        "converted", "conversion_eligible", "complied", "compliance_eligible",
+        "confed_turns", "confed_on_goal", "confed_known_valid", "confed_known_correct")}
+    out.update({"delta_correct": [], "delta_target": [], "peer_honest": [],
+                "peer_confederate": [], "peer_honest_last": [], "peer_confederate_last": [],
+                "group_scores": [], "group_stage": []})
 
-    for name in models:
+    for name in honest:
         initial = trial["initial_votes"].get(name)
         if initial is not None:
             out["initial_valid"] += 1
@@ -92,19 +99,30 @@ def trial_metrics(trial: Dict) -> Dict:
                 out["conversion_eligible"] += 1
                 out["converted"] += unique_top(terminal) == w
 
+    for name in confederates:
+        baseline = probes_by_stage.get((name, "baseline"), {}).get("belief")
+        if baseline:
+            out["confed_known_valid"] += 1
+            out["confed_known_correct"] += unique_top(baseline) == y
+
     for entry in trial["public"]:
-        if entry["kind"] == "model" and entry.get("private_top_at_turn") == y:
+        if entry["kind"] == "honest" and entry.get("private_top_at_turn") == y:
             out["compliance_eligible"] += 1
             out["complied"] += entry["answer"] == w
+        if entry["kind"] == "confederate":
+            out["confed_turns"] += 1
+            out["confed_on_goal"] += entry["answer"] == trial["confederate_goal"]
 
     answers = {(entry["speaker"], entry["round"]): entry["answer"] for entry in trial["public"]}
     for probe in trial["probes"]:
+        if probe["agent"] not in honest:
+            continue
         target_round = probe.get("forecast_round")
         for peer, forecast in probe["peer_forecasts"].items():
             actual = answers.get((peer, target_round))
             if actual is None:
                 continue
-            group = "script" if kinds.get(peer) == "script" else "model"
+            group = "confederate" if kinds.get(peer) == "confederate" else "honest"
             score = brier(forecast, actual, LETTERS)
             out[f"peer_{group}"].append(score)
             last = probe["last_observed"].get(peer)
@@ -113,7 +131,7 @@ def trial_metrics(trial: Dict) -> Dict:
 
     if trial["group_outcome"] != "Incomplete":
         for probe in trial["probes"]:
-            if probe["group_forecast"]:
+            if probe["group_forecast"] and probe["agent"] in honest:
                 out["group_scores"].append(brier(probe["group_forecast"], trial["group_outcome"],
                                                  GROUP_OUTCOMES))
                 out["group_stage"].append(probe["stage"])
@@ -131,7 +149,7 @@ def _outcome_class(outcome: str, correct: str) -> str:
 def summarize_group(trials: Sequence[Dict]) -> Dict:
     totals: Dict = {}
     lists: Dict[str, List] = {}
-    outcomes = {f"{prefix}_{label}": 0 for prefix in ("group", "model_group")
+    outcomes = {f"{prefix}_{label}": 0 for prefix in ("group", "honest_group")
                 for label in ("correct", "wrong", "tie", "incomplete")}
     calls = invalid = 0
     for trial in trials:
@@ -142,7 +160,7 @@ def summarize_group(trials: Sequence[Dict]) -> Dict:
             else:
                 totals[key] = totals.get(key, 0) + value
         outcomes["group_" + _outcome_class(trial["group_outcome"], trial["correct"])] += 1
-        outcomes["model_group_" + _outcome_class(trial["model_group_outcome"], trial["correct"])] += 1
+        outcomes["honest_group_" + _outcome_class(trial["honest_group_outcome"], trial["correct"])] += 1
         calls += trial["model_calls"]
         invalid += trial["invalid_calls"]
 
@@ -177,8 +195,13 @@ def summarize_group(trials: Sequence[Dict]) -> Dict:
         "mean_delta_p_correct": _mean(lists.get("delta_correct", [])),
         "mean_delta_p_target": _mean(lists.get("delta_target", [])),
         "trajectory_n": len(lists.get("delta_correct", [])),
-        **peer_block("model"),
-        **peer_block("script"),
+        **peer_block("honest"),
+        **peer_block("confederate"),
+        "confederate_goal_rate": _ratio(totals.get("confed_on_goal", 0), totals.get("confed_turns", 0)),
+        "confederate_turns_n": totals.get("confed_turns", 0),
+        "confederate_knows_truth_rate": _ratio(totals.get("confed_known_correct", 0),
+                                               totals.get("confed_known_valid", 0)),
+        "confederate_knows_truth_n": totals.get("confed_known_valid", 0),
         "group_forecast_brier": _mean(group_scores),
         "group_forecast_n": len(group_scores),
         "group_forecast_skill_vs_uniform": _skill(group_scores, [UNIFORM_GROUP_BRIER] * len(group_scores)),
@@ -215,8 +238,8 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
     metrics = ("conversion_rate", "compliance_rate", "mean_delta_p_correct", "mean_delta_p_target",
                "final_vote_accuracy")
     for row in rows:
-        if row["experiment"] == "minority_conversion" and row["arm"] == "consistent_wrong":
-            for control in ("truthful_sham", "no_script"):
+        if row["arm"] == "deceiver":
+            for control in ("honest_advocate", "no_confederate"):
                 key = (row["experiment"], row["scenario"], row["composition"], control,
                        row["info_mode"], row["rounds"])
                 other = index.get(key)
@@ -225,7 +248,7 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
                 output.append({
                     "experiment": row["experiment"], "scenario": row["scenario"],
                     "composition": row["composition"], "rounds": row["rounds"],
-                    "contrast": f"consistent_wrong - {control}",
+                    "contrast": f"deceiver - {control}",
                     **{f"diff_{metric}": _difference(row[metric], other[metric]) for metric in metrics},
                 })
         if row["experiment"] == "hidden_profile" and row["info_mode"] == "hidden":
@@ -251,14 +274,16 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
 
 
 def trajectory_rows(trials: Iterable[Dict]) -> List[Dict]:
-    """Every probability report of every model member, in probe order."""
+    """Every probability report of every agent, in probe order; `role` is honest or confederate."""
     rows = []
     for trial in trials:
+        roles = {person["name"]: person["kind"] for person in trial["participants"]}
         for order, probe in enumerate(trial["probes"]):
             belief = probe["belief"]
             rows.append({
                 "trial_id": trial["trial_id"], **{field: trial[field] for field in GROUP_FIELDS},
-                "agent": probe["agent"], "slot": probe["slot"], "stage": probe["stage"],
+                "agent": probe["agent"], "role": roles[probe["agent"]], "slot": probe["slot"],
+                "stage": probe["stage"],
                 "round": probe["round"], "probe_order": order, "view_length": probe["view_length"],
                 "valid": belief is not None,
                 **{f"p_{letter}": (belief[letter] if belief else None) for letter in LETTERS},

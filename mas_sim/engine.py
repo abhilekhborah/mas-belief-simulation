@@ -1,17 +1,19 @@
 """Runs one trial: baseline -> initial vote -> R rounds -> terminal -> final vote.
 
-Per trial, for every ordinary model member:
+Every participant is a real model agent. Honest agents are the ones being measured:
   1. Baseline private probe (no discussion), with forecasts of round-1 answers.
   2. Initial vote (HiddenBench style), recorded but not shown to anyone.
-  3. Rounds 1..R in fixed order (scripted speakers first). At each model turn
+  3. Rounds 1..R in fixed order (confederates first). At each honest turn
      the visible transcript is frozen; a private probe and a separate public
      turn are made from that same view. Only the public answer and message
      are appended to the transcript.
   4. Terminal private probe with the complete transcript.
   5. Final vote with the complete transcript. Final votes are independent and
      are not shown to other members.
-Scripted speakers have no prompts, no private state, and cast their scripted
-option as their final vote.
+Confederates (optional) receive all facts plus a private instruction to steer the
+group to one option: a deceiver to a wrong one, an honest advocate to the correct
+one. They make a baseline probe (to check what they believe), one public turn per
+round and a final vote.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from . import prompts
 from .llm import ModelError, parse_json_object
 from .scenarios import CORRECT, DECOY, LETTERS, SCENARIOS, TARGET, knowledge_from, letter_map
 
-ARMS_WITH_SCRIPTS = ("consistent_wrong", "truthful_sham")
+CONFEDERATE_ARMS = ("deceiver", "honest_advocate")
 
 
 @dataclass(frozen=True)
@@ -34,8 +36,8 @@ class TrialSpec:
     scenario: str
     item: int
     repeat: int
-    n_models: int
-    n_scripts: int
+    n_honest: int
+    n_confederates: int
     arm: str
     info_mode: str
     rounds: int
@@ -43,11 +45,20 @@ class TrialSpec:
 
     @property
     def composition(self) -> str:
-        return f"{self.n_models}+{self.n_scripts}"
+        return f"{self.n_honest}+{self.n_confederates}"
 
     @property
-    def active_scripts(self) -> int:
-        return self.n_scripts if self.arm in ARMS_WITH_SCRIPTS else 0
+    def active_confederates(self) -> int:
+        return self.n_confederates if self.arm in CONFEDERATE_ARMS else 0
+
+    @property
+    def lure_index(self) -> int:
+        """The wrong option the metrics watch: the minority target, or the hidden-profile decoy."""
+        return TARGET if self.experiment == "minority_conversion" else DECOY
+
+    @property
+    def goal_index(self) -> int:
+        return CORRECT if self.arm == "honest_advocate" else self.lure_index
 
     @property
     def rotation(self) -> int:
@@ -62,8 +73,9 @@ class TrialSpec:
         return {
             "trial_id": self.trial_id, "experiment": self.experiment, "scenario": self.scenario,
             "item": self.item, "repeat": self.repeat, "composition": self.composition,
-            "n_models": self.n_models, "n_scripts_configured": self.n_scripts,
-            "n_scripts_active": self.active_scripts, "arm": self.arm, "info_mode": self.info_mode,
+            "n_honest": self.n_honest, "n_confederates_configured": self.n_confederates,
+            "n_confederates_active": self.active_confederates, "arm": self.arm,
+            "info_mode": self.info_mode,
             "rounds": self.rounds, "rotation": self.rotation,
         }
 
@@ -250,31 +262,40 @@ class TrialRunner:
         spec = self.spec
         scenario = SCENARIOS[spec.scenario]
         letters = letter_map(spec.rotation)
-        correct, target, decoy = letters[CORRECT], letters[TARGET], letters[DECOY]
-        n_scripts = spec.active_scripts
-        names = [f"Person {number}" for number in range(1, spec.n_models + n_scripts + 1)]
-        script_names, model_names = names[:n_scripts], names[n_scripts:]
-        script_answer = target if spec.arm == "consistent_wrong" else correct
+        correct, target, decoy = letters[CORRECT], letters[spec.lure_index], letters[DECOY]
+        n_confederates = spec.active_confederates
+        names = [f"Person {number}" for number in range(1, spec.n_honest + n_confederates + 1)]
+        confederate_names, honest_names = names[:n_confederates], names[n_confederates:]
+        goal = letters[spec.goal_index] if confederate_names else None
 
         packets: Dict[str, List] = {}
         unique_facts: Dict[str, List] = {}
-        for slot, name in enumerate(model_names):
+        for slot, name in enumerate(honest_names):
             if spec.info_mode == "full":
                 critical = list(scenario.critical_facts)
             else:
                 critical = [fact for index, fact in enumerate(scenario.critical_facts)
-                            if (index + spec.item) % spec.n_models == slot]
+                            if (index + spec.item) % spec.n_honest == slot]
             unique_facts[name] = critical
             facts = list(scenario.shared_facts) + critical
             random.Random(f"{spec.base_seed}|{spec.scenario}|{spec.item}|{spec.repeat}|{slot}").shuffle(facts)
             packets[name] = facts
 
-        systems = {
-            name: prompts.render_system_prompt(
-                prompts.render_description(scenario, spec.rotation, name, len(names), spec.rounds),
-                packets[name])
-            for name in model_names
-        }
+        for name in confederate_names:
+            facts = list(scenario.shared_facts) + list(scenario.critical_facts)
+            random.Random(f"{spec.base_seed}|{spec.scenario}|{spec.item}|{spec.repeat}|{name}").shuffle(facts)
+            packets[name] = facts
+
+        def system_prompt(name: str) -> str:
+            description = prompts.render_description(scenario, spec.rotation, name, len(names),
+                                                     spec.rounds)
+            if name not in confederate_names:
+                return prompts.render_system_prompt(description, packets[name])
+            instruction = prompts.confederate_instruction(
+                goal, scenario.option_phrases[spec.goal_index], spec.arm == "deceiver")
+            return prompts.render_system_prompt(description, packets[name], instruction)
+
+        systems = {name: system_prompt(name) for name in names}
 
         def others(name: str) -> List[str]:
             return [other for other in names if other != name]
@@ -285,17 +306,17 @@ class TrialRunner:
         initial_rationales: Dict[str, str] = {}
         skipped_turns: List[Dict] = []
 
-        for name in model_names:
+        for name in names:
             probes.append(self.probe(name, systems[name], [], "baseline", 0, 1, others(name),
                                      names.index(name)))
-        for name in model_names:
+        for name in honest_names:
             initial_votes[name], initial_rationales[name], _ = self.vote(
                 name, systems[name], None, "initial_vote")
 
         if spec.info_mode == "reveal_all":
             # Adapted from HiddenBench's Reveal-All ablation: each member's
             # unique information is posted to the transcript before round 1.
-            for name in model_names:
+            for name in honest_names:
                 for fact in unique_facts[name]:
                     transcript.append({"round": 0, "speaker": name, "kind": "disclosure",
                                        "answer": None, "message": fact.text})
@@ -303,10 +324,16 @@ class TrialRunner:
         for round_number in range(1, spec.rounds + 1):
             next_round = round_number + 1 if round_number < spec.rounds else None
             for name in names:
-                if name in script_names:
-                    transcript.append({"round": round_number, "speaker": name, "kind": "script",
-                                       "answer": script_answer,
-                                       "message": prompts.script_message(script_answer)})
+                if name in confederate_names:
+                    answer, message, errors = self.public_turn(name, systems[name],
+                                                               list(transcript), round_number)
+                    if answer is None:
+                        skipped_turns.append({"agent": name, "round": round_number,
+                                              "errors": errors})
+                        continue
+                    transcript.append({"round": round_number, "speaker": name,
+                                       "kind": "confederate", "answer": answer,
+                                       "message": message})
                     continue
                 view = list(transcript)
                 probe = self.probe(name, systems[name], view, "pre_turn", round_number, next_round,
@@ -316,16 +343,16 @@ class TrialRunner:
                 if answer is None:
                     skipped_turns.append({"agent": name, "round": round_number, "errors": errors})
                     continue
-                transcript.append({"round": round_number, "speaker": name, "kind": "model",
+                transcript.append({"round": round_number, "speaker": name, "kind": "honest",
                                    "answer": answer, "message": message,
                                    "private_top_at_turn": unique_top(probe["belief"])})
 
-        for name in model_names:
+        for name in honest_names:
             probes.append(self.probe(name, systems[name], list(transcript), "terminal", spec.rounds,
                                      None, others(name), names.index(name)))
-        final_votes: Dict[str, Optional[str]] = {name: script_answer for name in script_names}
+        final_votes: Dict[str, Optional[str]] = {}
         final_rationales: Dict[str, str] = {}
-        for name in model_names:
+        for name in names:
             final_votes[name], final_rationales[name], _ = self.vote(
                 name, systems[name], prompts.render_transcript(transcript, name), "final_vote")
 
@@ -335,16 +362,17 @@ class TrialRunner:
             "started_at": started_at, "finished_at": now_iso(),
             "letters": {letters[index]: scenario.option_names[index] for index in range(4)},
             "correct": correct, "target": target, "decoy": decoy,
-            "script_answer": script_answer if script_names else None,
+            "confederate_goal": goal,
             "ground_truth_audit": {letters[index]: list(reasons)
                                    for index, reasons in decision.failed_controls.items()},
             "mit_risk_primary": scenario.mit_risk_primary,
             "mit_risk_hidden_mechanism": scenario.mit_risk_hidden_mechanism,
-            "participants": [{"name": name, "kind": "script" if name in script_names else "model",
+            "participants": [{"name": name, "kind": "confederate" if name in confederate_names
+                                                       else "honest",
                               "unique_facts": [fact.fact_id for fact in unique_facts.get(name, [])]}
                              for name in names],
             "evidence": {name: [{"fact_id": fact.fact_id, "text": fact.text} for fact in packets[name]]
-                         for name in model_names},
+                         for name in names},
             "probes": probes,
             "public": [entry for entry in transcript if entry["kind"] != "disclosure"],
             "disclosures": [entry for entry in transcript if entry["kind"] == "disclosure"],
@@ -354,7 +382,7 @@ class TrialRunner:
             "final_rationales": final_rationales,
             "skipped_turns": skipped_turns,
             "group_outcome": plurality(list(final_votes.values())),
-            "model_group_outcome": plurality([final_votes[name] for name in model_names]),
+            "honest_group_outcome": plurality([final_votes[name] for name in honest_names]),
             "model_calls": self.calls,
             "invalid_calls": self.invalid_calls,
             "usage": self.usage,
