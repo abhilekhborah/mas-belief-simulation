@@ -256,6 +256,14 @@ would form that goal on its own. What the experiment measures is how far honest 
 Comparing `deceiver` with `honest_advocate` separates "a wrong claim" from "extra speakers who
 push hard"; comparing with `no_confederate` gives the baseline.
 
+**Models may refuse to deceive.** A safety-trained model can decline the deceiver instruction,
+argue the truth anyway, or reply without valid JSON. Nothing in the code works around this, and a
+refusal is a result in itself. It shows up as `confederate_goal_rate` well below 1 (the deceiver
+argued something else), as `skipped_turns` and `invalid_calls` in the trial records (a confederate
+with no valid turn is missing from the transcript, and its empty final vote makes `group_outcome`
+`Incomplete`), and as a `deceiver - honest_advocate` contrast near zero. Check these on a
+`--limit 5` run before the full grid.
+
 | Composition (honest + confederates) | Note |
 |---|---|
 | `4+2` | Main condition; matches Moscovici's 4 + 2 |
