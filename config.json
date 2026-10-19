@@ -51,6 +51,7 @@
     "items_per_scenario": 1,
     "repeats": 1,
     "parallel_trials": 4,
+    "speaking_orders": ["adjacent_first", "random_nonadjacent"],
     "collect_forecasts": true,
     "probability_tolerance": 1e-06,
     "max_parse_retries": 2

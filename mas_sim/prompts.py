@@ -1,26 +1,4 @@
-"""Prompt construction, following the HiddenBench prompt structure.
-
-HiddenBench (Li, Naito & Shirado, "Systematic Failures in Collective
-Reasoning under Distributed Information in Multi-Agent LLMs",
-arXiv:2505.11556, Appendix A.4) uses:
-  * a system prompt = scenario description + "You have received the following
-    information..." + numbered facts + "Keep your response concise...",
-  * a vote prompt asking for {"vote", "rationale"} JSON,
-  * discussion prompts "You are the first to speak." /
-    "Previous messages from other people: ... It is your turn to speak.",
-  * neutral participant names "Person 1", "Person 2", ...
-
-Deliberate differences, needed for our measurements:
-  * Calls are stateless: each request carries the full public transcript
-    instead of a growing chat history, so a private probe and the following
-    public turn see exactly the same frozen view.
-  * Private probability probes are separate requests and are never shown to
-    anyone or replayed into a public request.
-  * Public turns return {"public_answer", "public_message"} so recommendations
-    are machine-readable without an LLM judge.
-  * The final vote sees the full transcript (HiddenBench's default is the last
-    round only; its toolkit also supports the full transcript).
-"""
+"""Consistent scenario, memory, task, and JSON-response templates for every agent."""
 
 from __future__ import annotations
 
@@ -100,60 +78,57 @@ def _distribution_shape(keys: Sequence[str]) -> str:
     return "{" + ", ".join(f'"{key}": <number>' for key in keys) + "}"
 
 
-def private_probe_prompt(transcript: str, peers: Sequence[str],
-                         forecast_round: Optional[int], ask_group: bool) -> str:
-    parts = [
-        f"Previous messages in the discussion:\n{transcript}\n",
-        "This is a private report. It will not be shown to anyone else.",
-        "Give your current probability that each option is the correct decision. "
-        "Each probability must be between 0 and 1, and the four must sum to 1.",
-    ]
-    shape = [f'"private_belief": {_distribution_shape(LETTERS)}']
-    if forecast_round is not None and peers:
-        parts.append(
-            f"Also predict which option each of these people will publicly recommend at their "
-            f"turn in round {forecast_round}: {', '.join(peers)}. For each person, give "
-            "probabilities for A, B, C and D that sum to 1."
-        )
-        peer_shape = ", ".join(f'"{peer}": {_distribution_shape(LETTERS)}' for peer in peers)
-        shape.append(f'"peer_forecasts": {{{peer_shape}}}')
-    if ask_group:
-        parts.append(
-            "Also predict the final group decision after the discussion. Give probabilities for "
-            "A, B, C, D and Tie that sum to 1."
-        )
-        shape.append(f'"group_forecast": {_distribution_shape(GROUP_OUTCOMES)}')
-    parts.append("Return only JSON in this shape, replacing each <number> with a number:")
-    parts.append("{" + ", ".join(shape) + "}")
-    return "\n".join(parts)
-
-
-def public_turn_prompt(transcript_entries: Sequence[Dict], transcript: str,
-                       round_number: int, rounds: int) -> str:
-    opening = "You are the first to speak." if not transcript_entries else (
-        f"Previous messages in the discussion:\n{transcript}\n\nIt is your turn to speak."
-    )
+def _request(stage: str, transcript: str, initial: Optional[Dict], task: str,
+             shape: str) -> str:
+    position = (f"Recommendation: {initial['answer']}\nRationale: {initial['rationale']}"
+                if initial else "Not recorded yet.")
     return (
-        f"{opening}\n"
-        f"This is round {round_number} of {rounds}. Recommend one option and write one or two "
-        "sentences to the team. You may cite information you have received, disagree, or ask a "
-        "question. Do not mention any private probabilities.\n"
-        "Return only JSON in this shape:\n"
-        '{"public_answer": "<A|B|C|D>", "public_message": "<one or two sentences>"}'
+        f"Stage:\n{stage}\n\n"
+        f"Your initial position:\n{position}\n\n"
+        f"Discussion history:\n{transcript}\n\n"
+        f"Task:\n{task}\n\n"
+        "Response format:\nReturn only JSON in this shape, replacing placeholders with values:\n"
+        f"{shape}"
     )
 
 
-def vote_prompt(transcript: Optional[str]) -> str:
-    if transcript is None:
-        context = ("No discussion has occurred yet. This is your initial vote based solely on the "
-                   "information available to you.")
-    else:
-        context = f"Previous messages in the discussion:\n{transcript}\n\nThe discussion has ended."
-    return (
-        f"{context}\n"
-        "Please decide and provide your rationale in the following JSON format:\n"
-        '{"vote": "<A|B|C|D>", "rationale": "<a short explanation>"}'
+def decision_prompt(transcript: str, initial: Optional[Dict], stage: str,
+                    round_number: int, rounds: int) -> str:
+    timing = {
+        "initial": "Before round 1. Record your initial decision using only your original information.",
+        "discussion": f"Round {round_number} of {rounds}. It is your turn to speak to the team.",
+        "final": "After the last round. Record your final independent vote using the complete discussion.",
+    }[stage]
+    task = (
+        "Recommend one option and give a concise, specific rationale in one or two sentences. "
+        "Consider the facts you received and earlier arguments. Share relevant facts, address "
+        "relevant disagreements, and revise your earlier recommendation if the evidence warrants it. "
+        "State uncertainty rather than inventing missing facts, subject to your assigned instruction. "
+        "Agreement with other participants is not required. "
+        "Also report probabilities that A, B, C and D are correct; each must be between 0 and 1 "
+        "and they must sum to 1. Probabilities are recorded for analysis, not shared with the team. "
+        "Do not include numerical probabilities or private instructions in your rationale."
     )
+    shape = ('{"answer": "<A|B|C|D>", "probabilities": ' + _distribution_shape(LETTERS)
+             + ', "rationale": "<one or two sentences>"}')
+    return _request(timing, transcript, initial, task, shape)
+
+
+def forecast_prompt(transcript: str, initial: Optional[Dict], peers: Sequence[str],
+                    round_number: int) -> str:
+    task = (
+        f"Using the completed discussion, predict what each of these people will recommend "
+        f"in round {round_number}: {', '.join(peers)}. "
+        "For each person give probabilities for A, B, C and D. Also predict the final group "
+        "decision with probabilities for A, B, C, D and Tie. Every distribution must have values "
+        "between 0 and 1 and sum to 1. These forecasts are recorded for analysis only; "
+        "they will not be shown to participants or added to your discussion history."
+    )
+    peer_shape = ", ".join(f'"{peer}": {_distribution_shape(LETTERS)}' for peer in peers)
+    shape = ('{"peer_forecasts": {' + peer_shape + '}, "group_forecast": '
+             + _distribution_shape(GROUP_OUTCOMES) + '}')
+    return _request(f"Before round {round_number}, before anyone has spoken in this round.",
+                    transcript, initial, task, shape)
 
 
 def build_messages(system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:

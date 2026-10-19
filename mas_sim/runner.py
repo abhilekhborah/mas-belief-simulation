@@ -23,10 +23,10 @@ from .experiments import build_trials, planned_calls
 from .llm import build_client, resolve_backend
 from .scenarios import verify_all
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENV_OVERRIDES = {"MAS_BASE_URL": "base_url", "MAS_API_KEY": "api_key", "MAS_MODEL": "model"}
-HEADLINE_METRICS = ("trials", "initial_vote_accuracy", "final_vote_accuracy", "conversion_rate",
-                    "compliance_rate", "mean_delta_p_correct", "mean_delta_p_target",
+HEADLINE_METRICS = ("trials", "initial_vote_accuracy", "final_vote_accuracy", "answer_change_rate",
+                    "answer_switch_to_target_rate", "mean_delta_p_correct", "mean_delta_p_target",
                     "group_forecast_brier")
 
 
@@ -70,12 +70,15 @@ def _redacted_llm(llm: Dict) -> Dict:
 
 def describe_plan(config: Dict) -> Dict:
     trials = build_trials(config)
+    forecasts = bool(config["run"].get("collect_forecasts", True))
     by_experiment: Dict[str, Dict[str, int]] = {}
     for trial in trials:
         entry = by_experiment.setdefault(trial.experiment, {"trials": 0, "calls": 0})
         entry["trials"] += 1
-        entry["calls"] += planned_calls(trial)
-    return {"trials": len(trials), "calls_without_retries": sum(map(planned_calls, trials)),
+        entry["calls"] += planned_calls(trial, forecasts)
+    return {"trials": len(trials),
+            "logical_conditions": sum(len(trial.analysis_conditions) for trial in trials),
+            "calls_without_retries": sum(planned_calls(trial, forecasts) for trial in trials),
             "by_experiment": by_experiment}
 
 
@@ -169,15 +172,15 @@ def _execute(client, config: Dict, settings: Dict, trials: List, chosen: str, gp
     finally:
         pool.shutdown(wait=True, cancel_futures=True)  # on Ctrl-C, queued trials are dropped
         results.sort(key=lambda record: order[record["trial_id"]])
-        _save(client, config, chosen, gpu, base, run_dir, started, status, len(trials), results,
-              failures)
+        _save(client, config, chosen, gpu, base, run_dir, started, status, len(trials),
+              sum(len(trial.analysis_conditions) for trial in trials), results, failures)
         if os.path.exists(partial_path):
             os.remove(partial_path)
     return run_dir
 
 
 def _save(client, config: Dict, chosen: str, gpu: bool, base: str, run_dir: str,
-          started: datetime, status: str, planned: int, results: List[Dict],
+          started: datetime, status: str, planned: int, logical_planned: int, results: List[Dict],
           failures: List[Dict]) -> None:
     finished = datetime.now().astimezone()
     summary_rows = metrics.summarize(results)
@@ -196,6 +199,8 @@ def _save(client, config: Dict, chosen: str, gpu: bool, base: str, run_dir: str,
         "backend": chosen, "client": client.name, "model": str(model) if model else None,
         "gpu": gpu, "command": sys.argv,
         "trials_planned": planned, "trials_completed": len(results),
+        "logical_conditions_planned": logical_planned,
+        "logical_conditions_completed": sum(len(record["analysis_conditions"]) for record in results),
         "trials_failed": len(failures),
         "model_calls": sum(record["model_calls"] for record in results),
         "invalid_calls": sum(record["invalid_calls"] for record in results),
@@ -207,19 +212,26 @@ def _save(client, config: Dict, chosen: str, gpu: bool, base: str, run_dir: str,
     }
     _write_json_atomically(os.path.join(run_dir, "results.json"), {
         "schema_version": SCHEMA_VERSION, "run": meta, "summary": summary_rows,
-        "contrasts": contrast_rows, "failed_trials": failures, "trials": results})
+        "contrasts": contrast_rows, "failed_trials": failures, "trials": results,
+        "shared_conditions": [{**condition, "source_trial_id": record["trial_id"]}
+                              for record in results for condition in record["analysis_conditions"]
+                              if condition["trial_id"] != record["trial_id"]]})
     _write_csv(os.path.join(run_dir, "summary.csv"), summary_rows)
     _write_csv(os.path.join(run_dir, "contrasts.csv"), contrast_rows)
     _write_csv(os.path.join(run_dir, "trajectories.csv"), metrics.trajectory_rows(results))
 
     headline: Dict[str, Dict] = {}
-    for experiment in sorted({record["experiment"] for record in results}):
-        row = metrics.summarize_group([r for r in results if r["experiment"] == experiment])
+    for experiment in sorted({condition["experiment"] for record in results
+                              for condition in record["analysis_conditions"]}):
+        row = metrics.summarize_group([
+            record for record in results
+            if any(condition["experiment"] == experiment for condition in record["analysis_conditions"])])
         headline[experiment] = {key: row[key] for key in HEADLINE_METRICS}
     entry = {key: meta[key] for key in ("run_id", "status", "started_at", "finished_at",
                                         "duration_seconds", "backend", "model", "trials_planned",
                                         "trials_completed", "trials_failed", "model_calls",
-                                        "invalid_calls")}
+                                        "invalid_calls", "logical_conditions_planned",
+                                        "logical_conditions_completed")}
     entry.update({"results_file": f"{run_id}/results.json", "headline": headline})
     with open(os.path.join(base, "history.jsonl"), "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
