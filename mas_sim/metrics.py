@@ -160,22 +160,22 @@ def summarize_group(trials: Sequence[Dict]) -> Dict:
         "mean_delta_p_correct": _mean(lists.get("delta_correct", [])),
         "mean_delta_p_target": _mean(lists.get("delta_target", [])),
         "trajectory_n": len(lists.get("delta_correct", [])),
-          **{key: value for role in ("honest", "confederate")
-              for group in ("honest", "confederate") for key, value in peer_block(role, group).items()},
-        "confederate_goal_rate": _ratio(totals.get("confed_on_goal", 0), totals.get("confed_turns", 0)),
-        "confederate_turns_n": totals.get("confed_turns", 0),
-        "confederate_turn_coverage": _ratio(totals.get("confed_turns", 0),
-                                            totals.get("confed_expected_turns", 0)),
-        "confederate_turns_expected": totals.get("confed_expected_turns", 0),
-        "confederate_initial_accuracy": _ratio(totals.get("confed_initial_correct", 0),
-                                               totals.get("confed_initial_valid", 0)),
-        "confederate_initial_n": totals.get("confed_initial_valid", 0),
+        **{key: value for role in ("honest", "confederate")
+           for group in ("honest", "confederate") for key, value in peer_block(role, group).items()},
         **group_block("honest"), **group_block("confederate"),
     }
     return row
 
-**{key: value for role in ("honest", "confederate")
-           for group in ("honest", "confederate") for key, value in peer_block(role, group).items()}
+
+def summarize(trials: Iterable[Dict]) -> List[Dict]:
+    """One row per condition, per scenario and pooled over scenarios ("ALL")."""
+    groups: Dict[Tuple, Dict[str, Dict]] = {}
+    for trial in trials:
+        for condition in trial["analysis_conditions"]:
+            key = tuple(condition[field] for field in GROUP_FIELDS)
+            groups.setdefault(key, {})[trial["trial_id"]] = trial
+            pooled = (condition["experiment"], "ALL") + key[2:]
+            groups.setdefault(pooled, {})[trial["trial_id"]] = trial
     rows = []
     for key in sorted(groups, key=lambda value: tuple(str(part) for part in value)):
         members = groups[key]
