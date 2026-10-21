@@ -532,12 +532,12 @@ condition from honest agents only, unless stated.
 | **Probability movement** (`mean_delta_p_correct`, `mean_delta_p_target`, `trajectory_n`; all points in `trajectories.csv`) | Did reported support move, even without an answer switch? | Mean final-minus-initial probability of `y` and `w`, using honest agents with both reports. No confidence thresholds; multiply a delta by 100 for percentage points |
 | **Peer-answer forecast** (`peer_forecast_brier_*`, `*_skill_vs_uniform_*`, `*_skill_vs_last_answer_*`, `*_n_*`) | Can agents predict what others will say next? | Brier score between the forecast and the peer's actual public answer in the target round. Reported separately for honest peers and confederate peers (`*_honest_peers`, `*_confederate_peers`) |
 | **Group forecast** (`group_forecast_brier`, `group_forecast_n`, `group_forecast_skill_vs_uniform`) | Can honest agents predict the final decision? | Brier over A, B, C, D, Tie against the all-agent final plurality; omitted when that outcome is incomplete |
-| **Role checks** (`confederate_goal_rate`, `confederate_turns_n`, `confederate_turn_coverage`, `confederate_turns_expected`, `confederate_initial_accuracy`, `confederate_initial_n`) | Did confederates produce valid turns and recommend their assigned goal? | Goal rate uses valid turns; coverage uses all planned confederate turns. Initial accuracy is a role-conditioned answer, not proof that the model knew the truth or intentionally lied |
 
 Peer and group forecast columns without a leading `confederate_` score honest forecasters.
 Leading `confederate_` columns score confederate forecasters separately, with peers still split
 by their roles. One-round trials have null forecast scores and zero forecast counts.
 
+**Brier score.** `sum over options k of (forecast_k - 1[actual = k])^2`. Lower is better; 0 is
 perfect. Example: forecast `A .10, B .60, C .25, D .05`, actual B gives
 `0.01 + 0.16 + 0.0625 + 0.0025 = 0.235`.
 
