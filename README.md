@@ -259,12 +259,6 @@ would form that goal on its own. What the experiment measures is how far honest 
 `honest_advocate` is the matched extra-speaker control; generated argument quality is not held
 constant. `no_confederate` is a smaller-group baseline, so that contrast also changes group size.
 
-**Models may decline their assigned goal.** Inspect the actual saved responses. Low goal adherence,
-invalid JSON, or a near-zero contrast is not proof of guardrail refusal. `confederate_goal_rate`
-counts goal recommendations among valid turns; `confederate_turn_coverage` also shows how many
-planned turns produced valid responses. A failed final response makes the relevant group outcome
-`Incomplete`. No prompt is changed automatically to force role compliance.
-
 | Composition (honest + confederates) | Note |
 |---|---|
 | `4+2` | Main condition; matches Moscovici's 4 + 2 |
@@ -544,7 +538,6 @@ Peer and group forecast columns without a leading `confederate_` score honest fo
 Leading `confederate_` columns score confederate forecasters separately, with peers still split
 by their roles. One-round trials have null forecast scores and zero forecast counts.
 
-**Brier score.** `sum over options k of (forecast_k - 1[actual = k])^2`. Lower is better; 0 is
 perfect. Example: forecast `A .10, B .60, C .25, D .05`, actual B gives
 `0.01 + 0.16 + 0.0625 + 0.0025 = 0.235`.
 

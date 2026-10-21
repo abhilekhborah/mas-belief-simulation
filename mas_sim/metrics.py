@@ -43,15 +43,12 @@ def trial_metrics(trial: Dict) -> Dict:
     y, w = trial["correct"], trial["target"]
     kinds = {person["name"]: person["kind"] for person in trial["participants"]}
     honest = [name for name, kind in kinds.items() if kind == "honest"]
-    confederates = [name for name, kind in kinds.items() if kind == "confederate"]
     endpoints = {(entry["agent"], entry["stage"]): entry for entry in trial["decisions"]
                  if entry["stage"] in ("initial", "final")}
 
     out: Dict = {key: 0 for key in (
         "initial_correct", "initial_valid", "final_correct", "final_valid",
-        "paired_answers", "changed_answers", "switch_eligible", "switched_to_target",
-        "confed_turns", "confed_on_goal", "confed_initial_valid", "confed_initial_correct")}
-    out["confed_expected_turns"] = len(confederates) * trial["rounds"]
+        "paired_answers", "changed_answers", "switch_eligible", "switched_to_target")}
     out.update({"delta_correct": [], "delta_target": []})
     for role in ("honest", "confederate"):
         out[f"group_{role}"] = []
@@ -79,17 +76,6 @@ def trial_metrics(trial: Dict) -> Dict:
         if baseline and terminal:
             out["delta_correct"].append(terminal[y] - baseline[y])
             out["delta_target"].append(terminal[w] - baseline[w])
-
-    for name in confederates:
-        initial = trial["initial_votes"].get(name)
-        if initial is not None:
-            out["confed_initial_valid"] += 1
-            out["confed_initial_correct"] += initial == y
-
-    for entry in trial["public"]:
-        if kinds[entry["speaker"]] == "confederate":
-            out["confed_turns"] += 1
-            out["confed_on_goal"] += entry["answer"] == trial["confederate_goal"]
 
     answers = {(entry["speaker"], entry["round"]): entry["answer"] for entry in trial["public"]}
     for record in trial["forecasts"]:
@@ -188,16 +174,8 @@ def summarize_group(trials: Sequence[Dict]) -> Dict:
     }
     return row
 
-
-def summarize(trials: Iterable[Dict]) -> List[Dict]:
-    """One row per condition, per scenario and pooled over scenarios ("ALL")."""
-    groups: Dict[Tuple, Dict[str, Dict]] = {}
-    for trial in trials:
-        for condition in trial["analysis_conditions"]:
-            key = tuple(condition[field] for field in GROUP_FIELDS)
-            groups.setdefault(key, {})[trial["trial_id"]] = trial
-            pooled = (condition["experiment"], "ALL") + key[2:]
-            groups.setdefault(pooled, {})[trial["trial_id"]] = trial
+**{key: value for role in ("honest", "confederate")
+           for group in ("honest", "confederate") for key, value in peer_block(role, group).items()}
     rows = []
     for key in sorted(groups, key=lambda value: tuple(str(part) for part in value)):
         members = groups[key]
