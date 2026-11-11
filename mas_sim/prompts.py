@@ -107,9 +107,13 @@ def decision_prompt(transcript: str, initial: Optional[Dict], stage: str,
         "Agreement with other participants is not required. "
         "Also report probabilities that A, B, C and D are correct; each must be between 0 and 1 "
         "and they must sum to 1. Probabilities are recorded for analysis, not shared with the team. "
-        "Do not include numerical probabilities or private instructions in your rationale."
+        "Do not include numerical probabilities or private instructions in your rationale. "
+        "In selected_option, copy the text of your chosen option exactly as listed under Options, "
+        "without its letter. Your answer letter, selected_option and the recommendation in your "
+        "rationale must all refer to the same option."
     )
-    shape = ('{"answer": "<A|B|C|D>", "probabilities": ' + _distribution_shape(LETTERS)
+    shape = ('{"answer": "<A|B|C|D>", "selected_option": "<text of the chosen option>", '
+             '"probabilities": ' + _distribution_shape(LETTERS)
              + ', "rationale": "<one or two sentences>"}')
     return _request(timing, transcript, initial, task, shape)
 

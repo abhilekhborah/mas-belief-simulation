@@ -131,6 +131,10 @@ def _clean(value: Dict, keys: Sequence[str]) -> Dict[str, float]:
     return {key: float(value[key]) for key in keys}
 
 
+def _normalize_option(text: str) -> str:
+    return " ".join(text.lower().strip().rstrip(".").split())
+
+
 class TrialRunner:
     def __init__(self, spec: TrialSpec, client, settings: Dict) -> None:
         self.spec = spec
@@ -142,6 +146,7 @@ class TrialRunner:
         self.calls = 0
         self.invalid_calls = 0
         self.usage: Dict[str, int] = {}
+        self.option_labels: Dict[str, Tuple[str, ...]] = {}
 
     # -- model call with validation and correction retries --------------------
     def _call(self, agent: str, system_prompt: str, user_prompt: str, spec: Dict,
@@ -198,6 +203,13 @@ class TrialRunner:
                 problems.append(f"probabilities: {error}")
             if not isinstance(obj.get("rationale"), str) or not obj["rationale"].strip():
                 problems.append("rationale must be a non-empty string")
+            selected = obj.get("selected_option")
+            if not isinstance(selected, str) or not selected.strip():
+                problems.append("selected_option must be the text of the chosen option")
+            elif obj.get("answer") in self.option_labels and _normalize_option(selected) not in {
+                    _normalize_option(label) for label in self.option_labels[obj["answer"]]}:
+                problems.append(f"answer {obj['answer']} and selected_option {selected!r} name different "
+                                "options; they must refer to the same option")
             return problems
 
         user_prompt = prompts.decision_prompt(
@@ -208,10 +220,16 @@ class TrialRunner:
                    "view_event_ids": view_ids}
         obj, errors = self._call(state.name, state.system_prompt, user_prompt, request, validator)
         valid = not errors and obj is not None
+        probabilities = _clean(obj["probabilities"], LETTERS) if valid else None
+        top = max(probabilities.values()) if probabilities else None
         return {"agent": state.name, "stage": stage, "round": round_number, "slot": slot,
                 "view_length": len(state.history), "view_event_ids": view_ids,
                 "answer": obj["answer"] if valid else None,
-                "probabilities": _clean(obj["probabilities"], LETTERS) if valid else None,
+                "selected_option": obj["selected_option"].strip() if valid else None,
+                "probabilities": probabilities,
+                # Expected to be False for confederates pushing a goal they do not believe.
+                "answer_matches_probability_top": (
+                    top - probabilities[obj["answer"]] <= self.tolerance) if valid else None,
                 "rationale": obj["rationale"].strip() if valid else "", "errors": errors}
 
     def forecast(self, state: AgentState, peers: List[str], round_number: int) -> Dict:
@@ -257,6 +275,8 @@ class TrialRunner:
         scenario = SCENARIOS[spec.scenario]
         letters = letter_map(spec.rotation)
         correct, target, decoy = letters[CORRECT], letters[spec.lure_index], letters[DECOY]
+        self.option_labels = {letters[index]: (scenario.option_phrases[index],
+                                               scenario.option_names[index]) for index in range(4)}
         n_confederates = spec.active_confederates
         names = [f"Person {number}" for number in range(1, spec.n_honest + n_confederates + 1)]
         confederate_names, honest_names = names[:n_confederates], names[n_confederates:]

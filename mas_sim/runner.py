@@ -23,7 +23,7 @@ from .experiments import build_trials, planned_calls
 from .llm import build_client, resolve_backend
 from .scenarios import verify_all
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ENV_OVERRIDES = {"MAS_BASE_URL": "base_url", "MAS_API_KEY": "api_key", "MAS_MODEL": "model"}
 HEADLINE_METRICS = ("trials", "initial_vote_accuracy", "final_vote_accuracy", "answer_change_rate",
                     "answer_switch_to_target_rate", "mean_delta_p_correct", "mean_delta_p_target",
