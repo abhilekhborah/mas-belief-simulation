@@ -678,6 +678,16 @@ are elicited outputs, not calibrated internal beliefs. A different answer and pr
 do not establish conscious compliance. Compare matched controls before attributing changes to
 deception; all-agent outcomes also include confederates' own ballots.
 
+**Compare within an experiment, not across them.** The two experiments use different discussion
+protocols, so a difference between them (for example, the deceiver effect in experiment 1 versus
+experiment 2, or experiment-1 accuracy versus experiment-2 `full` accuracy) may come from the
+protocol rather than the condition. Forecast scores are not comparable across experiments either:
+experiment 1 forecasts public recommendations, while experiment 2 forecasts private votes, and its
+agents do not know when the discussion ends. Compliance versus conversion (public answer versus
+private probability) exists only in experiment 1. Experiment-2 rows at different round counts come
+from the same conversations; treat the trial, not the round, as the unit. Experiment-2 results are
+not comparable with runs made before schema 4.
+
 Example, printing the headline contrast from a finished run:
 
 ```bash
