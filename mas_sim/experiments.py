@@ -23,13 +23,12 @@ Note: 4+2 vs 5+1 changes both minority size and honest count, and 3+1 also
 changes group size, so these are composition ablations rather than a clean
 test of minority fraction.
 
-Measured: honest-agent vote changes, continuous probability movement, and
-accuracy. The protocol follows HiddenBench: agents speak in free text, and
-each agent's vote (answer, probabilities, rationale) is collected privately
-after every round on a copy of its conversation, so voting never enters the
-discussion. Forecasters of both roles predict peers' next votes before rounds
-2..R. These are elicited reports, not evidence of hidden beliefs, conscious
-compliance, or refusal.
+Measured: honest-agent answer changes, continuous probability movement, and
+accuracy. Every participant supplies an answer, probabilities, and a rationale
+in one call per turn. Only answers and rationales enter other agents' history.
+Forecasters of both roles predict peers before rounds 2..R, after observing
+completed rounds. No forecast is requested before round 1. These are elicited
+reports, not evidence of hidden beliefs, conscious compliance, or refusal.
 
 Experiment 2: hidden-profile information pooling
 ------------------------------------------------
@@ -41,7 +40,12 @@ the distributed (unshared) information supported.
 
 Benchmark protocol: HiddenBench (Li, Naito & Shirado, arXiv:2505.11556).
 Shared facts favour a decoy; each member receives one unique critical fact;
-only pooling all of them reveals the correct option. Profiles:
+only pooling all of them reveals the correct option. This experiment follows
+HiddenBench's released prompts and simulator: members speak in free text, the
+messages are shown verbatim, and each member votes (answer, probabilities,
+rationale) privately after every round on a copy of its conversation, so voting
+never enters the discussion. Members are not told the number of rounds or the
+default-pass rule. Profiles:
   * full       every member receives every fact (individual upper bound),
   * hidden     shared facts + one unique critical fact per member,
   * hidden_cue hidden packets, and honest members are told "Other members may
@@ -56,15 +60,17 @@ agents). The second arm asks whether deception makes pooling fail further. An
 "honest_advocate" arm is allowed but would hand over the answer, so it is not
 in the default config.
 
-Rounds are nested. Agents are never told how many rounds there are, and the
-vote after round r uses the same prompt as a final vote, so one trial run for
-max(rounds) rounds yields the r-round result for every listed r. Results at
-different r therefore come from the same conversations (paired, not
-independent). Both experiments use the same wrong target. Identical
-full-information executions are shared through analysis-condition references.
-With two or more confederates, adjacent-first and seeded random-nonadjacent
-schedules are separate conditions; each schedule is fixed throughout the trial
-and matched across role arms.
+Experiment 1 runs every scenario family at 1, 2 and 3 rounds as separate,
+fresh trials (a 3-round trial is never truncated to make a 1-round result).
+Experiment 2's rounds are nested: agents never learn the number of rounds and
+the vote after round r uses the same prompt as a final vote, so one trial run
+for max(rounds) rounds yields the r-round result for every listed r (paired,
+not independent). Because the two experiments use different discussion
+protocols, experiment 2 runs its own full-information reference; no execution
+is shared between them. Both use the same wrong target. With two or more
+confederates, adjacent-first and seeded random-nonadjacent schedules are
+separate conditions; each schedule is fixed throughout the trial and matched
+across role arms.
 
 MIT AI Risk Repository classification (arXiv:2408.12622v3, Table 2): see
 scenarios.py. Experiment 1 inherits each family's primary subdomain (4.3,
@@ -105,7 +111,6 @@ def build_trials(config: Dict) -> List[TrialSpec]:
         for arm in minority["arms"]:
             if arm not in ALLOWED_ARMS:
                 raise ValueError(f"Unknown arm {arm}; use {ALLOWED_ARMS}")
-        depths = _depths(minority["rounds"])
         for n_honest, n_confederates in minority["compositions"]:
             if not 0 < n_confederates < (n_honest + n_confederates) / 2:
                 raise ValueError(f"Composition {n_honest}+{n_confederates} is not a minority")
@@ -113,9 +118,11 @@ def build_trials(config: Dict) -> List[TrialSpec]:
                 for item in range(items):
                     for repeat in range(repeats):
                         for arm in minority["arms"]:
-                            trials.append((TrialSpec(
-                                "minority_conversion", scenario, item, repeat, int(n_honest),
-                                int(n_confederates), arm, "full", depths[-1], seed), depths))
+                            for rounds in minority["rounds"]:
+                                trials.append((TrialSpec(
+                                    "minority_conversion", scenario, item, repeat, int(n_honest),
+                                    int(n_confederates), arm, "full", int(rounds), seed),
+                                    [int(rounds)]))
 
     hidden = config.get("experiment_2_hidden_profile", {})
     if hidden.get("enabled"):
@@ -132,7 +139,7 @@ def build_trials(config: Dict) -> List[TrialSpec]:
         for mode in hidden["info_modes"]:
             if mode not in ALLOWED_INFO_MODES:
                 raise ValueError(f"Unknown info mode {mode}; use {ALLOWED_INFO_MODES}")
-        depths = _depths(hidden["rounds"])
+        depths = sorted({int(value) for value in hidden["rounds"]})
         for scenario in scenario_keys:
             needed = len(SCENARIOS[scenario].critical_facts)
             if n_honest != needed:
@@ -143,17 +150,21 @@ def build_trials(config: Dict) -> List[TrialSpec]:
                         for mode in hidden["info_modes"]:
                             trials.append((TrialSpec(
                                 "hidden_profile", scenario, item, repeat, n_honest,
-                                n_confederates, arm, mode, depths[-1], seed), depths))
+                                n_confederates, arm, mode, depths[-1] if depths else 0, seed),
+                                depths))
     unique: List[TrialSpec] = []
     execution_index: Dict[tuple, int] = {}
     for trial, depths in trials:
+        if not depths or min(depths) < 1:
+            raise ValueError("rounds must be at least 1")
         applicable = orders if trial.active_confederates >= 2 else [
             "adjacent_first" if trial.active_confederates else "none"]
         for order in applicable:
             candidate = replace(trial, order_condition=order)
-            key = (candidate.scenario, candidate.item, candidate.repeat, candidate.n_honest,
-                   candidate.active_confederates, candidate.arm, candidate.info_mode,
-                   candidate.rounds, candidate.base_seed, candidate.order_condition)
+            key = (candidate.experiment, candidate.scenario, candidate.item, candidate.repeat,
+                   candidate.n_honest, candidate.active_confederates, candidate.arm,
+                   candidate.info_mode, candidate.rounds, candidate.base_seed,
+                   candidate.order_condition)
             conditions = tuple(candidate.condition(rounds) for rounds in depths)
             if key not in execution_index:
                 execution_index[key] = len(unique)
@@ -168,14 +179,14 @@ def build_trials(config: Dict) -> List[TrialSpec]:
     return unique
 
 
-def _depths(rounds: List[int]) -> List[int]:
-    depths = sorted({int(value) for value in rounds})
-    if not depths or depths[0] < 1:
-        raise ValueError("rounds must be a non-empty list of integers >= 1")
-    return depths
-
-
 def planned_calls(trial: TrialSpec, collect_forecasts: bool = True) -> int:
-    """All agents: initial vote, then per round one turn and one private vote, plus forecasts."""
+    """All agents, before retries, with forecasts before rounds 2..R.
+
+    Experiment 1: initial, one decision per round, final. Experiment 2: initial vote, then per
+    round one turn and one private vote.
+    """
     agents = trial.n_honest + trial.active_confederates
-    return agents * (1 + 2 * trial.rounds + (trial.rounds - 1 if collect_forecasts else 0))
+    forecasts = trial.rounds - 1 if collect_forecasts else 0
+    if trial.hiddenbench:
+        return agents * (1 + 2 * trial.rounds + forecasts)
+    return agents * (trial.rounds + 2 + forecasts)

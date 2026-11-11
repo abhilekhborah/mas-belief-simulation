@@ -3,9 +3,9 @@
 Accuracy, answer changes, and probability movement use honest agents only.
 Forecasts are scored separately by forecaster and peer role. Shared source
 trials are referenced by each analysis condition, never duplicated within a
-condition's sample. An r-round condition reads the private votes after round r
-of its source trial (rounds are nested). Empty denominators produce None, not
-zero.
+condition's sample. In experiment 2 an r-round condition reads the private
+votes after round r of its source trial (rounds are nested). Empty
+denominators produce None, not zero.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _skill(model_scores: Sequence[float], baseline_scores: Sequence[float]) -> O
 
 
 def condition_view(trial: Dict, rounds: int) -> Dict:
-    """The trial as an r-round trial: everything up to and including the vote after round r."""
+    """Experiment 2 trial as an r-round trial: everything up to the vote after round r."""
     if rounds == trial["rounds"]:
         return trial
     votes = trial["round_votes"][rounds - 1]
@@ -62,20 +62,24 @@ def condition_view(trial: Dict, rounds: int) -> Dict:
             "invalid_calls": sum(1 for entry in decisions + forecasts if entry["errors"]) + len(skipped)}
 
 
+def _is_final(entry: Dict, rounds: int) -> bool:
+    return entry["stage"] == "final" or (entry["stage"] == "round" and entry["round"] == rounds)
+
+
 def trial_metrics(trial: Dict) -> Dict:
     y, w = trial["correct"], trial["target"]
     kinds = {person["name"]: person["kind"] for person in trial["participants"]}
     honest = [name for name, kind in kinds.items() if kind == "honest"]
-    endpoints = {(entry["agent"], "initial" if entry["stage"] == "initial" else "final"): entry
+    endpoints = {(entry["agent"], "final" if _is_final(entry, trial["rounds"]) else "initial"): entry
                  for entry in trial["decisions"]
-                 if entry["stage"] == "initial" or entry["round"] == trial["rounds"]}
+                 if entry["stage"] == "initial" or _is_final(entry, trial["rounds"])}
 
     out: Dict = {key: 0 for key in (
         "initial_correct", "initial_valid", "final_correct", "final_valid",
         "paired_answers", "changed_answers", "switch_eligible", "switched_to_target")}
+    out.update({"delta_correct": [], "delta_target": []})
     out["honest_majority_correct"] = int(
         sum(trial["final_votes"].get(name) == y for name in honest) > len(honest) / 2)
-    out.update({"delta_correct": [], "delta_target": []})
     for role in ("honest", "confederate"):
         out[f"group_{role}"] = []
         for peer_role in ("honest", "confederate"):
@@ -103,11 +107,15 @@ def trial_metrics(trial: Dict) -> Dict:
             out["delta_correct"].append(terminal[y] - baseline[y])
             out["delta_target"].append(terminal[w] - baseline[w])
 
-    answers = {(entry["agent"], entry["round"]): entry["answer"] for entry in trial["decisions"]
-               if entry["stage"] == "round"}
+    if "round_votes" in trial:  # experiment 2: forecasts target the peer's private vote
+        answers = {(entry["agent"], entry["round"]): entry["answer"]
+                   for entry in trial["decisions"] if entry["stage"] == "round"}
+    else:
+        answers = {(entry["speaker"], entry["round"]): entry["answer"] for entry in trial["public"]}
     for record in trial["forecasts"]:
         role = kinds[record["agent"]]
         target_round = record["forecast_round"]
+        previous = record.get("last_observed", record.get("previous_vote", {}))
         for peer, forecast in record["peer_forecasts"].items():
             actual = answers.get((peer, target_round))
             if actual is None:
@@ -115,9 +123,9 @@ def trial_metrics(trial: Dict) -> Dict:
             group = f"{role}_{kinds[peer]}"
             score = brier(forecast, actual, LETTERS)
             out[f"peer_{group}"].append(score)
-            previous = record["previous_vote"].get(peer)
-            if previous is not None:
-                out[f"peer_{group}_last"].append((score, 0.0 if previous == actual else 2.0))
+            last = previous.get(peer)
+            if last is not None:
+                out[f"peer_{group}_last"].append((score, 0.0 if last == actual else 2.0))
         if trial["group_outcome"] != "Incomplete" and record["group_forecast"]:
             out[f"group_{role}"].append(brier(record["group_forecast"], trial["group_outcome"],
                                               GROUP_OUTCOMES))
@@ -223,7 +231,7 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
     index = {tuple(row[field] for field in GROUP_FIELDS): row for row in rows}
     output: List[Dict] = []
     metrics = ("answer_change_rate", "answer_switch_to_target_rate", "mean_delta_p_correct",
-               "mean_delta_p_target", "final_vote_accuracy", "honest_majority_accuracy")
+               "mean_delta_p_target", "final_vote_accuracy")
 
     def lookup(row: Dict, **changes) -> Optional[Dict]:
         condition = {**row, **changes}
@@ -233,7 +241,6 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
         if other is not None:
             output.append({**{field: row[field] for field in GROUP_FIELDS}, "contrast": label,
                            "control_arm": other["arm"],
-                           "control_info_mode": other["info_mode"],
                            "control_order_condition": other["order_condition"],
                            "left_source_trial_ids": row["source_trial_ids"],
                            "right_source_trial_ids": other["source_trial_ids"],
@@ -271,7 +278,8 @@ def contrasts(rows: Sequence[Dict]) -> List[Dict]:
 
 
 def trajectory_rows(trials: Iterable[Dict]) -> List[Dict]:
-    """Every initial and per-round vote, once per physical source trial."""
+    """Every report once per physical source trial: experiment 1 initial, discussion and final
+    decisions; experiment 2 initial and per-round votes."""
     rows = []
     for trial in trials:
         roles = {person["name"]: person["kind"] for person in trial["participants"]}

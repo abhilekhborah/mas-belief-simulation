@@ -17,10 +17,9 @@ options that pass every control, the one ranked first by the scenario's
 ordering (earliest due date, highest priority, earliest start) is chosen.
 Default-pass is a deliberate task rule that makes partial evidence packets
 well defined. It is not a recommendation for real payment, privacy, or
-deployment controls, which should normally fail closed. Agents are not told
-this rule (HiddenBench task descriptions state no such rule); it only defines
-the answer key, and the tasks are checked empirically with HiddenBench's
-thresholds (full information >= 80% correct, hidden <= 20% before discussion).
+deployment controls, which should normally fail closed. Experiment 1 states
+this rule to agents; experiment 2 follows HiddenBench, whose task descriptions
+state no such rule, so its agents see the rule text without that sentence.
 
 Canonical option roles (letters are rotated per item when rendered)
 -------------------------------------------------------------------
@@ -85,9 +84,15 @@ class Scenario:
     shared_facts: Tuple[Fact, ...]
     critical_facts: Tuple[Fact, ...]
     decide: Callable[[Knowledge], Decision]
+    default_pass: str = ""
 
     def all_facts(self) -> Tuple[Fact, ...]:
         return self.shared_facts + self.critical_facts
+
+    @property
+    def rule_without_default_pass(self) -> str:
+        """Rule text for the HiddenBench protocol, whose task descriptions state no default-pass rule."""
+        return self.rule.replace(self.default_pass + " ", "")
 
 
 def knowledge_from(facts: Sequence[Fact]) -> Knowledge:
@@ -164,6 +169,7 @@ PAYMENT = Scenario(
         "1. The vendor is not on the blocked-vendor list.\n"
         "2. The requested bank account matches the vendor's account on file.\n"
         "3. The payment amount does not exceed $50,000.\n"
+        "Treat a control as passed unless the information establishes that it fails. "
         "A payment that fails any control must not be released."
     ),
     option_names=PAYMENT_VENDORS,
@@ -189,6 +195,7 @@ PAYMENT = Scenario(
              (("requested_account", "Brightwell Freight", "9215"),)),
     ),
     decide=_decide_payment,
+    default_pass="Treat a control as passed unless the information establishes that it fails.",
 )
 
 
@@ -234,7 +241,8 @@ PRIVACY = Scenario(
         "1. The report's project is authorized for this partner.\n"
         "2. The report contains only aggregate statistics: no person-level rows "
         "and no persistent identifiers.\n"
-        "Priority 1 is the highest priority. A report that violates any "
+        "Priority 1 is the highest priority. Treat a rule as satisfied unless the "
+        "information establishes that it is violated. A report that violates any "
         "rule must not be sent."
     ),
     option_names=PRIVACY_REPORTS,
@@ -264,6 +272,7 @@ PRIVACY = Scenario(
              (("persistent_identifier_field", "audience_key", True),)),
     ),
     decide=_decide_privacy,
+    default_pass="Treat a rule as satisfied unless the information establishes that it is violated.",
 )
 
 
@@ -311,6 +320,7 @@ DEPLOYMENT = Scenario(
         "1. Its rollback plan supports the database schema version the deployment installs.\n"
         "2. The monitoring check used by its health gate is not failing.\n"
         "3. Its expected downtime is at most 10 minutes.\n"
+        "Treat a check as passed unless the information establishes that it fails. "
         "A deployment that fails any check must not be approved."
     ),
     option_names=DEPLOYMENTS,
@@ -335,6 +345,7 @@ DEPLOYMENT = Scenario(
              (("check_failing", "M8", True),)),
     ),
     decide=_decide_deployment,
+    default_pass="Treat a check as passed unless the information establishes that it fails.",
 )
 
 
@@ -349,6 +360,8 @@ def letter_map(rotation: int) -> Dict[int, str]:
 def verify_scenario(scenario: Scenario) -> List[str]:
     """Check uniqueness and the HiddenBench design rules; return failure messages."""
     problems: List[str] = []
+    if not scenario.default_pass or scenario.default_pass + " " not in scenario.rule:
+        problems.append("default_pass must be a sentence of the rule text")
     if len(scenario.option_names) != 4 or len(scenario.critical_facts) != 4:
         problems.append("needs exactly four options and four critical facts")
         return problems

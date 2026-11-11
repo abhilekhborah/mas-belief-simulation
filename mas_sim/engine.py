@@ -1,9 +1,11 @@
-"""HiddenBench-style trial: initial vote, free-text rounds, a private vote after every round, forecasts."""
+"""Trial runner. Experiment 1: initial decisions, fixed-order published decisions, pre-round
+forecasts, final decisions. Experiment 2: HiddenBench's free-text discussion with a private vote
+after every round."""
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -51,6 +53,11 @@ class TrialSpec:
         return (list(SCENARIOS).index(self.scenario) + self.item) % len(LETTERS)
 
     @property
+    def hiddenbench(self) -> bool:
+        """Experiment 2 follows HiddenBench's protocol; experiment 1 keeps the structured one."""
+        return self.experiment == "hidden_profile"
+
+    @property
     def trial_id(self) -> str:
         return (f"{self.experiment}/{self.scenario}/item{self.item}/rep{self.repeat}/"
                 f"{self.composition}/{self.arm}/{self.info_mode}/{self.order_condition}/R{self.rounds}")
@@ -79,8 +86,8 @@ class TrialSpec:
     def condition(self, rounds: Optional[int] = None) -> Dict:
         """Analysis condition; ``rounds`` below the trial's length reads the vote after that round."""
         rounds = self.rounds if rounds is None else rounds
-        trial_id = self.trial_id.rsplit("/R", 1)[0] + f"/R{rounds}"
-        return {"trial_id": trial_id, "experiment": self.experiment,
+        return {"trial_id": self.trial_id.rsplit("/R", 1)[0] + f"/R{rounds}",
+                "experiment": self.experiment,
                 "scenario": self.scenario, "composition": self.composition, "arm": self.arm,
                 "info_mode": self.info_mode, "rounds": rounds,
                 "order_condition": self.order_condition}
@@ -96,6 +103,14 @@ class TrialSpec:
             "order_condition": self.order_condition,
             "analysis_conditions": list(self.analysis_conditions) or [self.condition()],
         }
+
+
+@dataclass
+class AgentState:
+    name: str
+    system_prompt: str
+    initial_position: Optional[Dict] = None
+    history: List[Dict] = field(default_factory=list)
 
 
 def now_iso(precision: str = "milliseconds") -> str:
@@ -192,14 +207,13 @@ class TrialRunner:
             "latency_seconds": round(latency, 3),
         })
 
-    # -- call types ------------------------------------------------------------
-    def vote(self, name: str, conversation: List[Dict[str, str]], messages: Optional[List[str]],
-             round_number: int, slot: int, view_ids: List[int]) -> Dict:
-        """Private vote on a copy of the conversation; it never enters the agent's history."""
+    # -- reply checks shared by both protocols ----------------------------------
+    def _choice_validator(self, key: str):
+        """Checks a decision (key "answer") or a HiddenBench vote (key "vote")."""
         def validator(obj: Dict) -> List[str]:
             problems = []
-            if obj.get("vote") not in LETTERS:
-                problems.append("vote must be one of A, B, C, D")
+            if obj.get(key) not in LETTERS:
+                problems.append(f"{key} must be one of A, B, C, D")
             error = validate_distribution(obj.get("probabilities"), LETTERS, self.tolerance)
             if error:
                 problems.append(f"probabilities: {error}")
@@ -208,34 +222,27 @@ class TrialRunner:
             selected = obj.get("selected_option")
             if not isinstance(selected, str) or not selected.strip():
                 problems.append("selected_option must be the text of the chosen option")
-            elif obj.get("vote") in self.option_labels and _normalize_option(selected) not in {
-                    _normalize_option(label) for label in self.option_labels[obj["vote"]]}:
-                problems.append(f"vote {obj['vote']} and selected_option {selected!r} name different "
+            elif obj.get(key) in self.option_labels and _normalize_option(selected) not in {
+                    _normalize_option(label) for label in self.option_labels[obj[key]]}:
+                problems.append(f"{key} {obj[key]} and selected_option {selected!r} name different "
                                 "options; they must refer to the same option")
             return problems
+        return validator
 
-        stage = "initial" if round_number == 0 else "round"
-        request = {"call_kind": "vote", "stage": stage, "round": round_number,
-                   "view_event_ids": view_ids}
-        obj, errors = self._call(
-            name, conversation + [{"role": "user", "content": prompts.vote_prompt(messages)}],
-            request, validator)
+    def _choice_record(self, obj: Optional[Dict], errors: List[str], key: str, **fields) -> Dict:
         valid = not errors and obj is not None
         probabilities = _clean(obj["probabilities"], LETTERS) if valid else None
         top = max(probabilities.values()) if probabilities else None
-        return {"agent": name, "stage": stage, "round": round_number, "slot": slot,
-                "view_length": len(view_ids), "view_event_ids": view_ids,
-                "answer": obj["vote"] if valid else None,
+        return {**fields,
+                "answer": obj[key] if valid else None,
                 "selected_option": obj["selected_option"].strip() if valid else None,
                 "probabilities": probabilities,
                 # Expected to be False for confederates pushing a goal they do not believe.
                 "answer_matches_probability_top": (
-                    top - probabilities[obj["vote"]] <= self.tolerance) if valid else None,
+                    top - probabilities[obj[key]] <= self.tolerance) if valid else None,
                 "rationale": obj["rationale"].strip() if valid else "", "errors": errors}
 
-    def forecast(self, name: str, conversation: List[Dict[str, str]], messages: List[str],
-                 peers: List[str], round_number: int, previous_votes: Dict[str, Optional[str]],
-                 view_ids: List[int]) -> Dict:
+    def _forecast_validator(self, peers: List[str]):
         def validator(obj: Dict) -> List[str]:
             problems = []
             forecasts = obj.get("peer_forecasts")
@@ -251,20 +258,71 @@ class TrialRunner:
             if error:
                 problems.append(f"group_forecast: {error}")
             return problems
+        return validator
 
+    @staticmethod
+    def _forecast_fields(obj: Optional[Dict], errors: List[str], peers: List[str]) -> Dict:
+        valid = not errors and obj is not None
+        return {"peer_forecasts": {peer: _clean(obj["peer_forecasts"][peer], LETTERS)
+                                   for peer in peers} if valid else {},
+                "group_forecast": _clean(obj["group_forecast"], prompts.GROUP_OUTCOMES)
+                                  if valid else None}
+
+    # -- experiment 1 call types: structured, published decisions ---------------
+    def decision(self, state: AgentState, stage: str, round_number: int, slot: int) -> Dict:
+        user_prompt = prompts.decision_prompt(
+            prompts.render_transcript(state.history, state.name), state.initial_position,
+            stage, round_number, self.spec.rounds)
+        view_ids = [entry["event_id"] for entry in state.history]
+        request = {"call_kind": "decision", "stage": stage, "round": round_number,
+                   "view_event_ids": view_ids}
+        obj, errors = self._call(state.name, prompts.build_messages(state.system_prompt, user_prompt),
+                                 request, self._choice_validator("answer"))
+        return self._choice_record(obj, errors, "answer", agent=state.name, stage=stage,
+                                   round=round_number, slot=slot, view_length=len(state.history),
+                                   view_event_ids=view_ids)
+
+    def forecast(self, state: AgentState, peers: List[str], round_number: int) -> Dict:
+        user_prompt = prompts.forecast_prompt(
+            prompts.render_transcript(state.history, state.name), state.initial_position,
+            peers, round_number)
+        view_ids = [entry["event_id"] for entry in state.history]
+        request = {"call_kind": "forecast", "stage": "pre_round", "round": round_number,
+                   "peers": peers, "view_event_ids": view_ids}
+        obj, errors = self._call(state.name, prompts.build_messages(state.system_prompt, user_prompt),
+                                 request, self._forecast_validator(peers))
+        last = {entry["speaker"]: entry["answer"] for entry in state.history
+                if entry["kind"] != "disclosure"}
+        return {"agent": state.name, "stage": "pre_round", "round": round_number,
+                "forecast_round": round_number, "view_length": len(state.history),
+                "view_event_ids": view_ids, **self._forecast_fields(obj, errors, peers),
+                "last_observed": {peer: last.get(peer) for peer in peers}, "errors": errors}
+
+    # -- experiment 2 call types: HiddenBench private votes ----------------------
+    def vote(self, name: str, conversation: List[Dict[str, str]], messages: Optional[List[str]],
+             round_number: int, slot: int, view_ids: List[int]) -> Dict:
+        """Private vote on a copy of the conversation; it never enters the agent's history."""
+        stage = "initial" if round_number == 0 else "round"
+        request = {"call_kind": "vote", "stage": stage, "round": round_number,
+                   "view_event_ids": view_ids}
+        obj, errors = self._call(
+            name, conversation + [{"role": "user", "content": prompts.vote_prompt(messages)}],
+            request, self._choice_validator("vote"))
+        return self._choice_record(obj, errors, "vote", agent=name, stage=stage, round=round_number,
+                                   slot=slot, view_length=len(view_ids), view_event_ids=view_ids)
+
+    def hb_forecast(self, name: str, conversation: List[Dict[str, str]], messages: List[str],
+                    peers: List[str], round_number: int, previous_votes: Dict[str, Optional[str]],
+                    view_ids: List[int]) -> Dict:
         request = {"call_kind": "forecast", "stage": "pre_round", "round": round_number,
                    "peers": peers, "view_event_ids": view_ids}
         obj, errors = self._call(
-            name, conversation + [{"role": "user", "content": prompts.forecast_prompt(messages, peers)}],
-            request, validator)
-        valid = not errors and obj is not None
+            name, conversation + [{"role": "user",
+                                   "content": prompts.hb_forecast_prompt(messages, peers)}],
+            request, self._forecast_validator(peers))
         return {"agent": name, "stage": "pre_round", "round": round_number,
                 "forecast_round": round_number, "view_length": len(view_ids),
-                "view_event_ids": view_ids,
-                "peer_forecasts": {peer: _clean(obj["peer_forecasts"][peer], LETTERS)
-                                   for peer in peers} if valid else {},
-                "group_forecast": _clean(obj["group_forecast"], prompts.GROUP_OUTCOMES)
-                                  if valid else None,
+                "view_event_ids": view_ids, **self._forecast_fields(obj, errors, peers),
                 "previous_vote": {peer: previous_votes.get(peer) for peer in peers}, "errors": errors}
 
     # -- the trial ---------------------------------------------------------------
@@ -300,18 +358,135 @@ class TrialRunner:
             random.Random(f"{spec.base_seed}|{spec.scenario}|{spec.item}|{spec.repeat}|{name}").shuffle(facts)
             packets[name] = facts
 
+        cast = {"scenario": scenario, "names": names, "confederates": confederate_names,
+                "honest": honest_names, "order": order, "goal": goal, "packets": packets,
+                "unique_facts": unique_facts}
+        body = (self._hiddenbench_discussion(cast) if spec.hiddenbench
+                else self._structured_discussion(cast))
+        final_votes = body["final_votes"]
+
+        decision = scenario.decide(knowledge_from(scenario.all_facts()))
+        return {
+            **spec.to_dict(),
+            "protocol": "hiddenbench" if spec.hiddenbench else "structured",
+            "started_at": started_at, "finished_at": now_iso(),
+            "letters": {letters[index]: scenario.option_names[index] for index in range(4)},
+            "correct": correct, "target": target, "decoy": decoy,
+            "confederate_goal": goal,
+            "speaking_order": order, "order_seed": spec.order_seed,
+            "confederate_positions": [order.index(name) + 1 for name in confederate_names],
+            "ground_truth_audit": {letters[index]: list(reasons)
+                                   for index, reasons in decision.failed_controls.items()},
+            "mit_risk_primary": scenario.mit_risk_primary,
+            "mit_risk_hidden_mechanism": scenario.mit_risk_hidden_mechanism,
+            "participants": [{"name": name, "kind": "confederate" if name in confederate_names
+                                                       else "honest",
+                              "unique_facts": [fact.fact_id for fact in unique_facts.get(name, [])]}
+                             for name in names],
+            "evidence": {name: [{"fact_id": fact.fact_id, "text": fact.text} for fact in packets[name]]
+                         for name in names},
+            **body,
+            "group_outcome": plurality(list(final_votes.values())),
+            "honest_group_outcome": plurality([final_votes[name] for name in honest_names]),
+            "model_calls": self.calls,
+            "invalid_calls": self.invalid_calls,
+            "usage": self.usage,
+            "calls": self.call_log,
+        }
+
+    def _structured_discussion(self, cast: Dict) -> Dict:
+        """Experiment 1: every turn is a JSON decision; its answer and rationale are published."""
+        spec, scenario, goal = self.spec, cast["scenario"], cast["goal"]
+        names, confederate_names, honest_names = cast["names"], cast["confederates"], cast["honest"]
+        order, packets, unique_facts = cast["order"], cast["packets"], cast["unique_facts"]
+
+        def system_prompt(name: str) -> str:
+            description = prompts.render_description(scenario, spec.rotation, name, len(names),
+                                                     spec.rounds)
+            if name not in confederate_names:
+                return prompts.render_system_prompt(description, packets[name])
+            instruction = prompts.confederate_instruction(
+                goal, scenario.option_phrases[spec.goal_index], spec.arm == "deceiver")
+            return prompts.render_system_prompt(description, packets[name], instruction)
+
+        states = {name: AgentState(name, system_prompt(name)) for name in names}
+        decisions: List[Dict] = []
+        forecasts: List[Dict] = []
+        transcript: List[Dict] = []
+        skipped_turns: List[Dict] = []
+
+        def publish(entry: Dict) -> None:
+            visible = {**entry, "event_id": len(transcript) + 1}
+            transcript.append(visible)
+            for state in states.values():
+                state.history.append(dict(visible))
+
+        for name in names:
+            result = self.decision(states[name], "initial", 0, order.index(name))
+            decisions.append(result)
+            if result["answer"] is not None:
+                states[name].initial_position = {"answer": result["answer"],
+                                                 "rationale": result["rationale"]}
+
+        if spec.info_mode == "reveal_all":
+            for name in honest_names:
+                for fact in unique_facts[name]:
+                    publish({"round": 0, "speaker": name, "kind": "disclosure",
+                             "answer": None, "message": fact.text})
+
+        for round_number in range(1, spec.rounds + 1):
+            if self.collect_forecasts and round_number >= 2:
+                for name in names:
+                    forecasts.append(self.forecast(states[name],
+                                                    [other for other in names if other != name],
+                                                    round_number))
+            for slot, name in enumerate(order):
+                result = self.decision(states[name], "discussion", round_number, slot)
+                decisions.append(result)
+                if result["answer"] is None:
+                    skipped_turns.append({"agent": name, "round": round_number,
+                                          "errors": result["errors"]})
+                    continue
+                publish({"round": round_number, "speaker": name, "kind": "message",
+                         "answer": result["answer"], "message": result["rationale"]})
+
+        for name in names:
+            decisions.append(self.decision(states[name], "final", spec.rounds, order.index(name)))
+
+        initial = {entry["agent"]: entry for entry in decisions if entry["stage"] == "initial"}
+        final = {entry["agent"]: entry for entry in decisions if entry["stage"] == "final"}
+        return {
+            "agent_histories": {name: {"initial_position": state.initial_position,
+                                       "public_history": state.history}
+                                for name, state in states.items()},
+            "decisions": decisions,
+            "forecasts": forecasts,
+            "public": [entry for entry in transcript if entry["kind"] != "disclosure"],
+            "disclosures": [entry for entry in transcript if entry["kind"] == "disclosure"],
+            "initial_votes": {name: initial[name]["answer"] for name in names},
+            "initial_rationales": {name: initial[name]["rationale"] for name in names},
+            "final_votes": {name: final[name]["answer"] for name in names},
+            "final_rationales": {name: final[name]["rationale"] for name in names},
+            "skipped_turns": skipped_turns,
+        }
+
+    def _hiddenbench_discussion(self, cast: Dict) -> Dict:
+        """Experiment 2: HiddenBench's free-text turns, with a private vote after every round."""
+        spec, scenario, goal = self.spec, cast["scenario"], cast["goal"]
+        names, confederate_names, honest_names = cast["names"], cast["confederates"], cast["honest"]
+        order, packets, unique_facts = cast["order"], cast["packets"], cast["unique_facts"]
         cue = prompts.ASYMMETRY_CUE if spec.info_mode == "hidden_cue" else ""
 
         def extra(name: str) -> str:
             return cue if name in honest_names else ""
 
         def system_prompt(name: str) -> str:
-            description = prompts.render_description(scenario, spec.rotation, name, len(names))
+            description = prompts.hb_description(scenario, spec.rotation, name, len(names))
             if name not in confederate_names:
-                return prompts.render_system_prompt(description, packets[name], extra(name))
-            instruction = prompts.confederate_instruction(
+                return prompts.hb_system_prompt(description, packets[name], extra(name))
+            instruction = prompts.hb_confederate_instruction(
                 goal, scenario.option_phrases[spec.goal_index], spec.arm == "deceiver")
-            return prompts.render_system_prompt(description, packets[name], instruction)
+            return prompts.hb_system_prompt(description, packets[name], instruction)
 
         conversations = {name: [{"role": "system", "content": system_prompt(name)}] for name in names}
         seen = {name: 0 for name in names}  # transcript events already in each conversation
@@ -346,7 +521,7 @@ class TrialRunner:
             if self.collect_forecasts and round_number >= 2:
                 previous = [entry for entry in transcript if entry["round"] == round_number - 1]
                 for name in names:
-                    forecasts.append(self.forecast(
+                    forecasts.append(self.hb_forecast(
                         name, conversations[name], lines(previous),
                         [other for other in names if other != name], round_number, round_votes[-1],
                         shown(name, previous)))
@@ -377,27 +552,7 @@ class TrialRunner:
 
         final = {entry["agent"]: entry for entry in decisions
                  if entry["stage"] == "round" and entry["round"] == spec.rounds}
-        final_votes = round_votes[-1]
-
-        decision = scenario.decide(knowledge_from(scenario.all_facts()))
         return {
-            **spec.to_dict(),
-            "started_at": started_at, "finished_at": now_iso(),
-            "letters": {letters[index]: scenario.option_names[index] for index in range(4)},
-            "correct": correct, "target": target, "decoy": decoy,
-            "confederate_goal": goal,
-            "speaking_order": order, "order_seed": spec.order_seed,
-            "confederate_positions": [order.index(name) + 1 for name in confederate_names],
-            "ground_truth_audit": {letters[index]: list(reasons)
-                                   for index, reasons in decision.failed_controls.items()},
-            "mit_risk_primary": scenario.mit_risk_primary,
-            "mit_risk_hidden_mechanism": scenario.mit_risk_hidden_mechanism,
-            "participants": [{"name": name, "kind": "confederate" if name in confederate_names
-                                                       else "honest",
-                              "unique_facts": [fact.fact_id for fact in unique_facts.get(name, [])]}
-                             for name in names],
-            "evidence": {name: [{"fact_id": fact.fact_id, "text": fact.text} for fact in packets[name]]
-                         for name in names},
             "conversations": conversations,
             "decisions": decisions,
             "forecasts": forecasts,
@@ -406,15 +561,9 @@ class TrialRunner:
             "initial_votes": {name: initial[name]["answer"] for name in names},
             "initial_rationales": {name: initial[name]["rationale"] for name in names},
             "round_votes": round_votes,
-            "final_votes": final_votes,
+            "final_votes": round_votes[-1],
             "final_rationales": {name: final[name]["rationale"] for name in names},
             "skipped_turns": skipped_turns,
-            "group_outcome": plurality(list(final_votes.values())),
-            "honest_group_outcome": plurality([final_votes[name] for name in honest_names]),
-            "model_calls": self.calls,
-            "invalid_calls": self.invalid_calls,
-            "usage": self.usage,
-            "calls": self.call_log,
         }
 
 
