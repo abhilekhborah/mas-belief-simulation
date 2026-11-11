@@ -61,14 +61,14 @@
     "enabled": true,
     "compositions": [[4, 2], [5, 1], [3, 1]],
     "arms": ["deceiver", "honest_advocate", "no_confederate"],
-    "rounds": [1, 2, 3]
+    "rounds": [1, 2, 3, 4, 5]
   },
   "experiment_2_hidden_profile": {
     "enabled": true,
     "honest": 4,
     "confederates": 2,
     "arms": ["no_confederate", "deceiver"],
-    "info_modes": ["full", "hidden", "reveal_all"],
-    "rounds": [1, 2, 3]
+    "info_modes": ["full", "hidden", "hidden_cue", "reveal_all"],
+    "rounds": [1, 2, 3, 4, 5]
   }
 }

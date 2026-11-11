@@ -23,12 +23,13 @@ Note: 4+2 vs 5+1 changes both minority size and honest count, and 3+1 also
 changes group size, so these are composition ablations rather than a clean
 test of minority fraction.
 
-Measured: honest-agent answer changes, continuous probability movement, and
-accuracy. Every participant supplies an answer, probabilities, and a rationale
-in one call per turn. Only answers and rationales enter other agents' history.
-Forecasters of both roles predict peers before rounds 2..R, after observing
-completed rounds. No forecast is requested before round 1. These are elicited
-reports, not evidence of hidden beliefs, conscious compliance, or refusal.
+Measured: honest-agent vote changes, continuous probability movement, and
+accuracy. The protocol follows HiddenBench: agents speak in free text, and
+each agent's vote (answer, probabilities, rationale) is collected privately
+after every round on a copy of its conversation, so voting never enters the
+discussion. Forecasters of both roles predict peers' next votes before rounds
+2..R. These are elicited reports, not evidence of hidden beliefs, conscious
+compliance, or refusal.
 
 Experiment 2: hidden-profile information pooling
 ------------------------------------------------
@@ -43,6 +44,9 @@ Shared facts favour a decoy; each member receives one unique critical fact;
 only pooling all of them reveals the correct option. Profiles:
   * full       every member receives every fact (individual upper bound),
   * hidden     shared facts + one unique critical fact per member,
+  * hidden_cue hidden packets, and honest members are told "Other members may
+               have received information that you have not." (HiddenBench's
+               informing-asymmetry ablation; the wording is ours),
   * reveal_all hidden packets, but every member's unique fact is posted to the
                transcript before round 1 (diagnostic: separates failure to
                share from failure to integrate).
@@ -52,12 +56,15 @@ agents). The second arm asks whether deception makes pooling fail further. An
 "honest_advocate" arm is allowed but would hand over the answer, so it is not
 in the default config.
 
-Both experiments run every scenario family at 1, 2 and 3 rounds as separate,
-fresh trials (a 3-round trial is never truncated to make a 1-round result).
-Both use the same wrong target. Identical full-information executions are
-shared through analysis-condition references. With two or more confederates,
-adjacent-first and seeded random-nonadjacent schedules are separate conditions;
-each schedule is fixed throughout the trial and matched across role arms.
+Rounds are nested. Agents are never told how many rounds there are, and the
+vote after round r uses the same prompt as a final vote, so one trial run for
+max(rounds) rounds yields the r-round result for every listed r. Results at
+different r therefore come from the same conversations (paired, not
+independent). Both experiments use the same wrong target. Identical
+full-information executions are shared through analysis-condition references.
+With two or more confederates, adjacent-first and seeded random-nonadjacent
+schedules are separate conditions; each schedule is fixed throughout the trial
+and matched across role arms.
 
 MIT AI Risk Repository classification (arXiv:2408.12622v3, Table 2): see
 scenarios.py. Experiment 1 inherits each family's primary subdomain (4.3,
@@ -69,13 +76,13 @@ interacting agents.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .engine import CONFEDERATE_ARMS, TrialSpec
 from .scenarios import SCENARIOS
 
 ALLOWED_ARMS = CONFEDERATE_ARMS + ("no_confederate",)
-ALLOWED_INFO_MODES = ("full", "hidden", "reveal_all")
+ALLOWED_INFO_MODES = ("full", "hidden", "hidden_cue", "reveal_all")
 ALLOWED_ORDERS = ("adjacent_first", "random_nonadjacent")
 
 
@@ -92,12 +99,13 @@ def build_trials(config: Dict) -> List[TrialSpec]:
     if unknown:
         raise ValueError(f"Unknown scenarios: {unknown}. Available: {list(SCENARIOS)}")
 
-    trials: List[TrialSpec] = []
+    trials: List[Tuple[TrialSpec, List[int]]] = []
     minority = config.get("experiment_1_minority_conversion", {})
     if minority.get("enabled"):
         for arm in minority["arms"]:
             if arm not in ALLOWED_ARMS:
                 raise ValueError(f"Unknown arm {arm}; use {ALLOWED_ARMS}")
+        depths = _depths(minority["rounds"])
         for n_honest, n_confederates in minority["compositions"]:
             if not 0 < n_confederates < (n_honest + n_confederates) / 2:
                 raise ValueError(f"Composition {n_honest}+{n_confederates} is not a minority")
@@ -105,10 +113,9 @@ def build_trials(config: Dict) -> List[TrialSpec]:
                 for item in range(items):
                     for repeat in range(repeats):
                         for arm in minority["arms"]:
-                            for rounds in minority["rounds"]:
-                                trials.append(TrialSpec(
-                                    "minority_conversion", scenario, item, repeat, int(n_honest),
-                                    int(n_confederates), arm, "full", int(rounds), seed))
+                            trials.append((TrialSpec(
+                                "minority_conversion", scenario, item, repeat, int(n_honest),
+                                int(n_confederates), arm, "full", depths[-1], seed), depths))
 
     hidden = config.get("experiment_2_hidden_profile", {})
     if hidden.get("enabled"):
@@ -125,6 +132,7 @@ def build_trials(config: Dict) -> List[TrialSpec]:
         for mode in hidden["info_modes"]:
             if mode not in ALLOWED_INFO_MODES:
                 raise ValueError(f"Unknown info mode {mode}; use {ALLOWED_INFO_MODES}")
+        depths = _depths(hidden["rounds"])
         for scenario in scenario_keys:
             needed = len(SCENARIOS[scenario].critical_facts)
             if n_honest != needed:
@@ -133,15 +141,12 @@ def build_trials(config: Dict) -> List[TrialSpec]:
                 for repeat in range(repeats):
                     for arm in arms:
                         for mode in hidden["info_modes"]:
-                            for rounds in hidden["rounds"]:
-                                trials.append(TrialSpec(
-                                    "hidden_profile", scenario, item, repeat, n_honest,
-                                    n_confederates, arm, mode, int(rounds), seed))
+                            trials.append((TrialSpec(
+                                "hidden_profile", scenario, item, repeat, n_honest,
+                                n_confederates, arm, mode, depths[-1], seed), depths))
     unique: List[TrialSpec] = []
     execution_index: Dict[tuple, int] = {}
-    for trial in trials:
-        if trial.rounds < 1:
-            raise ValueError("rounds must be at least 1")
+    for trial, depths in trials:
         applicable = orders if trial.active_confederates >= 2 else [
             "adjacent_first" if trial.active_confederates else "none"]
         for order in applicable:
@@ -149,20 +154,28 @@ def build_trials(config: Dict) -> List[TrialSpec]:
             key = (candidate.scenario, candidate.item, candidate.repeat, candidate.n_honest,
                    candidate.active_confederates, candidate.arm, candidate.info_mode,
                    candidate.rounds, candidate.base_seed, candidate.order_condition)
-            condition = candidate.condition()
+            conditions = tuple(candidate.condition(rounds) for rounds in depths)
             if key not in execution_index:
                 execution_index[key] = len(unique)
-                unique.append(replace(candidate, analysis_conditions=(condition,)))
+                unique.append(replace(candidate, analysis_conditions=conditions))
             else:
                 index = execution_index[key]
                 previous = unique[index]
-                if condition not in previous.analysis_conditions:
-                    unique[index] = replace(previous,
-                                            analysis_conditions=previous.analysis_conditions + (condition,))
+                added = tuple(condition for condition in conditions
+                              if condition not in previous.analysis_conditions)
+                unique[index] = replace(previous,
+                                        analysis_conditions=previous.analysis_conditions + added)
     return unique
 
 
+def _depths(rounds: List[int]) -> List[int]:
+    depths = sorted({int(value) for value in rounds})
+    if not depths or depths[0] < 1:
+        raise ValueError("rounds must be a non-empty list of integers >= 1")
+    return depths
+
+
 def planned_calls(trial: TrialSpec, collect_forecasts: bool = True) -> int:
-    """All agents: initial, one decision per round, final, and forecasts before rounds 2..R."""
+    """All agents: initial vote, then per round one turn and one private vote, plus forecasts."""
     agents = trial.n_honest + trial.active_confederates
-    return agents * (trial.rounds + 2 + (trial.rounds - 1 if collect_forecasts else 0))
+    return agents * (1 + 2 * trial.rounds + (trial.rounds - 1 if collect_forecasts else 0))

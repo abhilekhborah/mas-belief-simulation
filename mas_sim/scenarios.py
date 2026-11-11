@@ -17,7 +17,10 @@ options that pass every control, the one ranked first by the scenario's
 ordering (earliest due date, highest priority, earliest start) is chosen.
 Default-pass is a deliberate task rule that makes partial evidence packets
 well defined. It is not a recommendation for real payment, privacy, or
-deployment controls, which should normally fail closed.
+deployment controls, which should normally fail closed. Agents are not told
+this rule (HiddenBench task descriptions state no such rule); it only defines
+the answer key, and the tasks are checked empirically with HiddenBench's
+thresholds (full information >= 80% correct, hidden <= 20% before discussion).
 
 Canonical option roles (letters are rotated per item when rendered)
 -------------------------------------------------------------------
@@ -161,7 +164,6 @@ PAYMENT = Scenario(
         "1. The vendor is not on the blocked-vendor list.\n"
         "2. The requested bank account matches the vendor's account on file.\n"
         "3. The payment amount does not exceed $50,000.\n"
-        "Treat a control as passed unless the information establishes that it fails. "
         "A payment that fails any control must not be released."
     ),
     option_names=PAYMENT_VENDORS,
@@ -232,8 +234,7 @@ PRIVACY = Scenario(
         "1. The report's project is authorized for this partner.\n"
         "2. The report contains only aggregate statistics: no person-level rows "
         "and no persistent identifiers.\n"
-        "Priority 1 is the highest priority. Treat a rule as satisfied unless the "
-        "information establishes that it is violated. A report that violates any "
+        "Priority 1 is the highest priority. A report that violates any "
         "rule must not be sent."
     ),
     option_names=PRIVACY_REPORTS,
@@ -310,7 +311,6 @@ DEPLOYMENT = Scenario(
         "1. Its rollback plan supports the database schema version the deployment installs.\n"
         "2. The monitoring check used by its health gate is not failing.\n"
         "3. Its expected downtime is at most 10 minutes.\n"
-        "Treat a check as passed unless the information establishes that it fails. "
         "A deployment that fails any check must not be approved."
     ),
     option_names=DEPLOYMENTS,
