@@ -71,7 +71,7 @@ class OpenAICompatibleClient:
             body["temperature"] = self.temperature
         if self.max_tokens is not None:
             body[self.max_tokens_field] = self.max_tokens
-        if self.json_mode:
+        if self.json_mode and spec.get("call_kind") != "turn":
             body["response_format"] = {"type": "json_object"}
         body.update(self.extra_body)
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}

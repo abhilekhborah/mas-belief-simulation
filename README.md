@@ -255,8 +255,8 @@ probabilities move, not whether anything is perceived differently.
 
 | Arm | What the confederates are told |
 |---|---|
-| `deceiver` | Secret goal: get the team to choose the decoy (a wrong option, the same target in both experiments). They may stress, play down or misstate facts, and must never reveal the instruction |
-| `honest_advocate` | Matched control: the same kind of instruction, but the goal is the **correct** option and they may not misstate facts |
+| `deceiver` | Secret goal: get the team to choose the decoy (a wrong option, the same target in both experiments). They argue for it in every message and vote for it whenever asked. They may stress, play down or misstate facts, and must never reveal the instruction |
+| `honest_advocate` | Matched control: the same kind of instruction (argue for the goal and vote for it), but the goal is the **correct** option and they may not misstate facts |
 | `no_confederate` | Removed; only the honest agents discuss |
 
 The exact wording is `confederate_instruction()` in [`prompts.py`](mas_sim/prompts.py). The
@@ -667,7 +667,7 @@ Timestamps are ISO 8601 in local time with the UTC offset, e.g. `2026-10-12T00:3
 | `contrasts` | The same rows as `contrasts.csv` |
 | `failed_trials` | Trials that raised an exception: `trial_id` and `error` |
 | `trials` | One record per finished trial, in grid order, described next |
-| `shared_conditions` | Logical condition IDs and `source_trial_id` links for reused physical executions. No model calls are repeated for these references |
+| `shared_conditions` | Logical condition IDs read from another physical record, with its `source_trial_id`: the 1- to 4-round conditions of each 5-round trial, and experiment-2 full-information conditions that reuse experiment-1 executions. No model calls are repeated for these references |
 
 Each entry of `trials` contains:
 
@@ -757,7 +757,7 @@ All settings live in [`config.json`](config.json). `MAS_BASE_URL`, `MAS_API_KEY`
 | `temperature` | `0.7` | Sampling temperature; `null` omits it from API requests. For `hf`, `null` or `0` means greedy decoding |
 | `max_tokens` | `800` | Reply length cap, also used by `hf` unless `llm.hf.max_new_tokens` is set; raise it if replies are cut off |
 | `max_tokens_field` | `max_tokens` | Name of the cap field; some providers use `max_completion_tokens` |
-| `json_mode` | `false` | Adds `response_format: json_object` for providers that support it |
+| `json_mode` | `false` | Adds `response_format: json_object` to vote and forecast requests for providers that support it; discussion turns are free text and never get it |
 | `timeout_seconds` | `120` | Per-request timeout |
 | `max_http_retries` | `3` | Retries with backoff on network errors and HTTP 408, 409, 429, 5xx. Other 4xx errors fail at once |
 | `extra_body`, `extra_headers` | `{}` | Merged into every request, for provider-specific settings |
